@@ -1,0 +1,151 @@
+# Neutral test fixture: generic capabilities exercising every orchestration feature. No domain meaning.
+- id: item.ingest
+  version: 1.0.0
+  description: Turn one input item into a normalised record.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [item]
+    properties:
+      item: {type: object}
+  output_schema:
+    type: object
+    required: [id]
+    properties:
+      id: {type: string}
+  samples:
+    - item: {id: sample-1}
+
+- id: item.analyze
+  version: 1.0.0
+  description: Analyse one record against a profile.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [item, profile]
+    properties:
+      item: {type: object}
+      profile: {type: string}
+  output_schema:
+    type: object
+    required: [results]
+    properties:
+      results: {type: array}
+
+- id: result.check
+  version: 1.0.0
+  description: Check results against their source records.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [results, items]
+    properties:
+      results: {type: array}
+      items: {type: array}
+  output_schema:
+    type: object
+    required: [results]
+    properties:
+      results: {type: array}
+
+- id: result.score
+  version: 1.0.0
+  description: Score checked results against a profile.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [results, profile]
+    properties:
+      results: {type: array}
+      profile: {type: string}
+  output_schema:
+    type: object
+    required: [flags]
+    properties:
+      flags: {type: array}
+
+- id: result.contrast
+  version: 1.0.0
+  description: Contrast results across records for selected keys.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [results, keys]
+    properties:
+      results: {type: array}
+      keys: {type: array, items: {type: string}}
+  output_schema:
+    type: object
+    required: [rows]
+    properties:
+      rows: {type: array}
+
+- id: result.merge
+  version: 1.0.0
+  description: Merge results, flags and an optional contrast into one view.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [results, flags]
+    properties:
+      results: {type: array}
+      flags: {type: array}
+      comparison: {type: [object, "null"]}
+  output_schema:
+    type: object
+
+- id: text.summarize
+  version: 1.0.0
+  description: Summarise structured content in a locale.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [content, locale]
+    properties:
+      content: {type: object}
+      locale: {type: string}
+  output_schema:
+    type: object
+    required: [text]
+    properties:
+      text: {type: string}
+
+- id: action.plan
+  version: 1.0.0
+  description: Turn selected results into action proposals with payload hashes.
+  effects: read
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [results, selected]
+    properties:
+      results: {type: array}
+      selected: {type: array, items: {type: string}}
+  output_schema:
+    type: object
+    required: [proposals]
+    properties:
+      proposals: {type: array}
+
+- id: action.apply
+  version: 1.0.0
+  description: Apply one approved action in an external system.
+  effects: write
+  input_schema:
+    type: object
+    additionalProperties: false
+    required: [payload]
+    properties:
+      payload: {type: object}
+  output_schema:
+    type: object
+    required: [reference]
+    properties:
+      reference: {type: string}

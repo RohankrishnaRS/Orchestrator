@@ -1,0 +1,94 @@
+# Neutral test fixture: fan-out, retry, join, optional guarded branch, human input, approved idempotent write.
+id: sample-pipeline
+version: 1.0.0
+goal: Exercise every orchestration feature with domain-neutral steps
+
+inputs:
+  items: {type: artifact_list, minItems: 1, maxItems: 20}
+  profile: {type: string, default: profile/standard@1}
+  contrast_keys: {type: string_list, default: []}
+
+nodes:
+  - id: ingest
+    capability: item.ingest
+    for_each: $inputs.items
+    max_concurrency: 6
+    inputs: {item: $item}
+    timeout_s: 60
+
+  - id: analyze
+    capability: item.analyze
+    depends_on: [ingest]
+    for_each: $nodes.ingest.items
+    max_concurrency: 4
+    inputs: {item: $item.output, profile: $inputs.profile}
+    timeout_s: 240
+    retry: {max_attempts: 3, backoff_s: [2, 8], retry_on: [timeout, unavailable]}
+
+  - id: check
+    capability: result.check
+    depends_on: [analyze]
+    inputs:
+      results: $nodes.analyze.items[*].output.results
+      items: $nodes.ingest.items[*].output
+    timeout_s: 60
+
+  - id: score
+    capability: result.score
+    depends_on: [check]
+    inputs: {results: $nodes.check.output.results, profile: $inputs.profile}
+    timeout_s: 30
+
+  - id: contrast
+    capability: result.contrast
+    depends_on: [check]
+    condition: len($inputs.contrast_keys) > 0
+    inputs: {results: $nodes.check.output.results, keys: $inputs.contrast_keys}
+    timeout_s: 180
+
+  - id: merge
+    capability: result.merge
+    depends_on: [score, contrast]
+    inputs:
+      results: $nodes.check.output.results
+      flags: $nodes.score.output.flags
+      comparison: $nodes.contrast.output | default(null)
+    timeout_s: 30
+
+  - id: summarize
+    capability: text.summarize
+    depends_on: [merge]
+    inputs: {content: $nodes.merge.output, locale: $run.locale}
+    timeout_s: 120
+
+  - id: choose
+    type: human_input
+    depends_on: [summarize]
+    prompt_key: choose_results_for_action
+    input_schema:
+      type: object
+      required: [selected_ids]
+      properties:
+        selected_ids: {type: array, items: {type: string}}
+
+  - id: plan
+    capability: action.plan
+    depends_on: [choose]
+    condition: len($nodes.choose.output.selected_ids) > 0
+    inputs: {results: $nodes.check.output.results, selected: $nodes.choose.output.selected_ids}
+    timeout_s: 60
+
+  - id: apply
+    capability: action.apply
+    depends_on: [plan]
+    for_each: $nodes.plan.output.proposals
+    inputs: {payload: $item.payload}
+    effect: write
+    approval: {required: true, binds_to: payload_hash}
+    idempotency_key: "{run.id}:{node.id}:{item.key}:{item.payload_hash}"
+    retry: {max_attempts: 1}
+    timeout_s: 30
+
+outputs:
+  summary: $nodes.summarize.output
+  applied: $nodes.apply.items[*].output | default([])
