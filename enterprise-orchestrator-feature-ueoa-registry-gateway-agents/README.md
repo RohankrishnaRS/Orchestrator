@@ -18,11 +18,19 @@ pausing for human input and approvals.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\python.exe -m uvicorn ueoa.api.app:create_app --factory --host 127.0.0.1 --port 8000
+$key = Read-Host "Azure OpenAI API key" -AsSecureString
+$env:AZURE_OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $key).Password
+$env:AZURE_OPENAI_ENDPOINT = "https://secureapi-aoai-north-central-us.openai.azure.com"
+$env:AZURE_OPENAI_DEPLOYMENT = "gpt-4o"
+$env:AZURE_API_VERSION = "2024-10-21"
+.\.venv\Scripts\python.exe -m uvicorn ueoa.api.app:create_app --factory --host 127.0.0.1 --port 8766
 ```
 
-Open **http://127.0.0.1:8000** (API docs at `/docs`). The core starts with an empty registry; register your own
-capabilities and agent implementations through the API. Configure `UEOA_LLM_*` environment variables to enable planning.
+Open **http://127.0.0.1:8766** (API docs at `/docs`). The key prompt does not echo the key. Keep the server running in
+this PowerShell window; environment variables are scoped to that process. AI agent generation and workflow planning use
+Azure OpenAI only. Hosted agents use the application address that receives their registration request, so agents work
+when the server runs on a non-default local port. Set `UEOA_PUBLIC_BASE_URL` when the app is behind a proxy or must be
+reachable at a different address. The app reads environment variables directly and does not automatically load `.env`.
 Set `UEOA_DATA_DIR` before starting the API to persist hosted-agent definitions, workflow templates, and Skills catalog
 entries between restarts:
 
@@ -41,6 +49,13 @@ cd ..
 ```
 
 Use the **Orchestrate** page to plan and run goals against the capabilities and agents you register.
+In Orchestrator chat, select a saved workflow and describe the task in the composer. The chat goal is bound to the
+workflow's best matching declared text input (for example `prompt`, `task_description`, or `source_text`); provide
+other required values through **+ → Workflow inputs (JSON)**. The workflow must include an executable agent/tool step
+to produce an answer.
+The **Create → Prompt Builder** page uses Azure OpenAI to refine task requirements; choose **Use prompt in workflow**
+to hand the result to the visual workflow generator. Generation only uses capabilities with approved implementations.
+If none are approved, register an agent implementation and approve it before generating executable workflow steps.
 
 ## MCP endpoint
 

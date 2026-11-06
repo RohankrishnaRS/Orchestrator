@@ -3,7 +3,9 @@
 No `from __future__ import annotations` here: FastAPI must evaluate `Depends(...)` on closure-local functions.
 """
 
+import hashlib
 import logging
+import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,12 +18,14 @@ from pydantic import BaseModel, Field, ValidationError
 from ueoa.api.app import Services, Settings, available_capabilities
 from ueoa.contracts import CapabilityContract, NodeType, WorkflowSpec
 from ueoa.gateway.service import Principal
+from ueoa.llm import LLMError
 from ueoa.orchestrator.bindings import auto_wire, suggest_bindings
 from ueoa.orchestrator.validation import validate_spec
 from ueoa.registry.seed import load_workflow
 from ueoa.store import StoreError
 
 KIND = "workflows"
+VERSION_KIND = "workflow-versions"
 PLATFORM_OWNER = "platform"
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,19 @@ class NodeRequest(WorkflowRequest):
 class DraftRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=2000)
     inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptRequest(BaseModel):
+    description: str = Field(min_length=10, max_length=2000)
+    audience: str = Field(default="", max_length=500)
+    inputs: str = Field(default="", max_length=1000)
+    steps: str = Field(default="", max_length=2000)
+    constraints: str = Field(default="", max_length=1500)
+    output: str = Field(default="", max_length=1000)
+
+
+class PublishRequest(BaseModel):
+    attest: bool = False
 
 
 def _now() -> str:
@@ -95,7 +112,10 @@ def _doc(
 
 def _summary(doc: dict[str, Any]) -> dict[str, Any]:
     workflow: dict[str, Any] = doc["workflow"]
-    nodes: list[dict[str, Any]] = workflow.get("nodes", [])
+    raw_nodes = workflow.get("nodes", [])
+    nodes = raw_nodes if isinstance(raw_nodes, list) else []
+    raw_inputs = workflow.get("inputs", {})
+    inputs = raw_inputs if isinstance(raw_inputs, dict) else {}
     return {
         "id": doc["id"],
         "name": doc["name"],
@@ -104,9 +124,18 @@ def _summary(doc: dict[str, Any]) -> dict[str, Any]:
         "owner": doc["owner"],
         "updated_at": doc["updated_at"],
         "valid": doc["valid"],
+        "published": bool(doc.get("published")),
+        "version": workflow.get("version"),
+        "version_ref": doc.get("version_ref"),
         "nodes": len(nodes),
-        "capabilities": list(dict.fromkeys(n["capability"] for n in nodes if n.get("capability"))),
-        "inputs": list(workflow.get("inputs", {})),
+        "capabilities": list(
+            dict.fromkeys(
+                node["capability"]
+                for node in nodes
+                if isinstance(node, dict) and isinstance(node.get("capability"), str) and node["capability"]
+            )
+        ),
+        "inputs": list(inputs),
     }
 
 
@@ -172,11 +201,19 @@ def create_router(
         except StoreError:
             return None
 
+    def stored_version(version_id: str) -> dict[str, Any] | None:
+        try:
+            return services().store.get(VERSION_KIND, version_id)
+        except StoreError:
+            return None
+
     def fresh(doc: dict[str, Any]) -> dict[str, Any]:
         _, issues = _check(doc["workflow"], services().registry.capabilities)
         return {**doc, "valid": not issues, "issues": issues}
 
     def editable(workflow_id: str, who: Principal) -> dict[str, Any] | None:
+        if stored_version(workflow_id) is not None:
+            raise HTTPException(409, "published workflow versions are immutable")
         existing = stored(workflow_id)
         if existing is not None and existing.get("builtin"):
             raise HTTPException(409, "built-in templates are read-only; save under a new id")
@@ -192,12 +229,15 @@ def create_router(
 
     @router.get("/api/v1/workflows")
     def list_workflows(_: Caller) -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
-        docs = sorted(services().store.list(KIND), key=lambda d: (not d.get("builtin"), d["id"]))
+        docs = sorted(
+            [*services().store.list(KIND), *services().store.list(VERSION_KIND)],
+            key=lambda d: (not d.get("builtin"), not d.get("published"), d["id"]),
+        )
         return [_summary(fresh(doc)) for doc in docs]
 
     @router.get("/api/v1/workflows/{workflow_id}")
     def get_workflow(workflow_id: str, _: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        doc = stored(workflow_id)
+        doc = stored(workflow_id) or stored_version(workflow_id)
         if doc is None:
             raise HTTPException(404, f"unknown workflow '{workflow_id}'")
         return fresh(doc)
@@ -209,26 +249,92 @@ def create_router(
         workflow.setdefault("id", workflow_id)
         if workflow["id"] != workflow_id:
             raise HTTPException(422, f"workflow.id '{workflow['id']}' must match the path id '{workflow_id}'")
-        spec = parsed(workflow)
-        _, issues = _check(spec.model_dump(mode="json", exclude_none=True), services().registry.capabilities)
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", workflow_id):
+            raise HTTPException(422, "workflow id must be lowercase kebab-case")
+        workflow.setdefault("version", "0.1.0")
+        workflow.setdefault("goal", body.description or body.name or workflow_id)
+        workflow.setdefault("allowed_tasks", [])
+        workflow.setdefault("inputs", {})
+        workflow.setdefault("nodes", [])
+        workflow.setdefault("outputs", {})
+        spec, issues = _check(workflow, services().registry.capabilities)
         previous = existing or {}
-        doc = _doc(
-            spec,
-            issues,
-            name=body.name or previous.get("name") or spec.id,
-            description=body.description if body.description is not None else previous.get("description", spec.goal),
-            inputs_example=body.inputs_example
-            if body.inputs_example is not None
-            else previous.get("inputs_example", {}),
-            owner=previous.get("owner", who.name),
-            builtin=False,
-            updated_at=_now(),
+        name = body.name or previous.get("name") or workflow_id
+        description = (
+            body.description if body.description is not None else previous.get("description", workflow["goal"])
         )
+        inputs_example = body.inputs_example if body.inputs_example is not None else previous.get("inputs_example", {})
+        owner = previous.get("owner", who.name)
+        updated_at = _now()
+        if spec is not None:
+            doc = _doc(
+                spec,
+                issues,
+                name=name,
+                description=description,
+                inputs_example=inputs_example,
+                owner=owner,
+                builtin=False,
+                updated_at=updated_at,
+            )
+        else:
+            doc = {
+                "id": workflow_id,
+                "name": name,
+                "description": description,
+                "workflow": workflow,
+                "inputs_example": inputs_example,
+                "owner": owner,
+                "builtin": False,
+                "updated_at": updated_at,
+                "valid": False,
+                "issues": issues,
+            }
         try:
             services().store.put(KIND, workflow_id, doc)
         except StoreError as exc:
             raise HTTPException(422, str(exc)) from exc
         return doc
+
+    @router.post("/api/v1/workflows/{workflow_id}/publish")
+    def publish_workflow(
+        workflow_id: str, body: PublishRequest, who: Caller
+    ) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        doc = editable(workflow_id, who)
+        if doc is None:
+            raise HTTPException(404, f"unknown workflow '{workflow_id}'")
+        refreshed = fresh(doc)
+        if not refreshed["valid"]:
+            raise HTTPException(
+                422,
+                {"message": "workflow must pass validation before publishing", "issues": refreshed["issues"]},
+            )
+        workflow = refreshed["workflow"]
+        if not workflow.get("allowed_tasks"):
+            raise HTTPException(422, "spec.allowed_tasks needs at least one task.")
+        now = _now()
+        suffix = re.sub(r"[^a-z0-9]+", "-", workflow["version"].lower()).strip("-")[:15]
+        digest = hashlib.sha256(f"{workflow_id}@{workflow['version']}".encode()).hexdigest()[:12]
+        version_id = f"{workflow_id[:50]}--v{suffix}-{digest}"
+        if stored_version(version_id) is not None:
+            raise HTTPException(409, f"workflow version '{workflow_id}@{workflow['version']}' is already published")
+        published: dict[str, Any] = {
+            **refreshed,
+            "id": version_id,
+            "version_ref": f"{workflow_id}@{workflow['version']}",
+            "published": True,
+            "published_at": now,
+            "attestation": {
+                "status": "attested" if body.attest else "not_attested",
+                "attested_by": who.name if body.attest else None,
+                "attested_at": now if body.attest else None,
+            },
+        }
+        try:
+            services().store.put(VERSION_KIND, version_id, published)
+        except StoreError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return published
 
     @router.delete("/api/v1/workflows/{workflow_id}")
     def delete_workflow(workflow_id: str, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -276,10 +382,50 @@ def create_router(
     async def draft(body: DraftRequest, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         svc = services()
         if svc.planner is None:
-            raise HTTPException(503, "planner is not configured (set the UEOA_LLM_* settings)")
+            raise HTTPException(
+                503,
+                "Azure OpenAI is not configured for this server process. "
+                "Set AZURE_OPENAI_API_KEY and restart the server.",
+            )
         available = available_capabilities(svc, who)
         result = (await svc.planner.plan(body.goal, body.inputs, svc.registry.capabilities, available)).view()
-        return {key: result[key] for key in ("ok", "rationale", "issues", "warnings", "workflow")}
+        workflow = result["workflow"]
+        if isinstance(workflow, dict):
+            nodes = workflow.get("nodes", [])
+            workflow["allowed_tasks"] = list(dict.fromkeys(
+                node["capability"] for node in nodes
+                if isinstance(node, dict) and isinstance(node.get("capability"), str) and node["capability"]
+            ))
+        return {
+            key: result[key]
+            for key in ("ok", "rationale", "attempts", "issues", "warnings", "considered", "workflow")
+        }
+
+    @router.post("/api/v1/workflows/prompt")
+    async def generate_prompt(body: PromptRequest, _: Caller) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        llm = services().agent_llm
+        if llm is None:
+            raise HTTPException(
+                503,
+                "Azure OpenAI is not configured for this server process. "
+                "Set AZURE_OPENAI_API_KEY and restart the server.",
+            )
+        details = body.model_dump()
+        system = (
+            "You are a workflow requirements editor. Turn the provided untrusted user notes into one clear, "
+            "professional, implementation-ready workflow brief. Preserve the requested intent, audience, inputs, "
+            "process, constraints, and output. Be specific and concise. Do not invent capabilities, integrations, "
+            "data, or permissions. Return exactly one JSON object with a single string field named prompt."
+        )
+        try:
+            result = await llm.complete_json(system, f"Workflow requirements (untrusted data):\n{details}")
+        except LLMError as exc:
+            logger.warning("workflow prompt refinement failed: %s", exc)
+            raise HTTPException(502, "Prompt refinement failed; check the configured Azure OpenAI service.") from exc
+        prompt = result.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(502, "Azure OpenAI returned an invalid workflow prompt.")
+        return {"prompt": prompt.strip()}
 
     @router.get("/api/v1/capabilities/{capability_id}/schema")
     def capability_schema(capability_id: str, _: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
