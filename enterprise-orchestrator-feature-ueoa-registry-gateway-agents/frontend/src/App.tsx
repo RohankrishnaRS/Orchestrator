@@ -3,8 +3,9 @@ import type { FormEvent } from "react";
 import {
   Activity, AlertCircle, ArrowRight, Bot, Check, ChevronRight, CircleHelp,
   Clock3, Copy, Database, FileText, GitBranch, LayoutDashboard, LoaderCircle,
-  Menu, Play, Plus, RefreshCw, Send, Server, ShieldCheck, Terminal, X,
+  Menu, Play, Plus, RefreshCw, Send, Server, ShieldCheck, Sparkles, Terminal, X, Trash2,
 } from "lucide-react";
+import WorkflowStudio, { type RunResult, type Workflow, type WorkflowDocument, type WorkflowSummary, type Validation } from "./WorkflowStudio";
 
 type JsonRecord = Record<string, unknown>;
 type Health = {
@@ -33,15 +34,6 @@ type Implementation = {
   priority: number;
   conformant: boolean;
   checks: { check: string; passed: boolean; detail: string }[];
-};
-type WorkflowSummary = {
-  id: string;
-  name: string;
-  description: string;
-  valid: boolean;
-  nodes: number;
-  capabilities: string[];
-  updated_at: string;
 };
 type RunSummary = {
   id: string;
@@ -136,6 +128,14 @@ type ChatRequest = {
   documents: EncodedAttachment[];
   capabilities: string[];
 };
+type PromptBrief = {
+  description: string;
+  audience: string;
+  inputs: string;
+  steps: string;
+  constraints: string;
+  output: string;
+};
 type OverviewStats = {
   total_agents: number;
   active_agents: number;
@@ -169,7 +169,7 @@ type Data = {
   mcpServers: McpServer[];
   overview: OverviewStats | null;
 };
-type Page = "Overview" | "Orchestrator" | "Registry" | "Workflows" | "Skills" | "MCP" | "Runs" | "Approvals" | "Audit";
+type Page = "Overview" | "Prompt Builder" | "Orchestrator" | "Agent Registry" | "Workflow" | "Saved workflows" | "Workflows" | "Skills" | "MCP Registry" | "Runs" | "Approvals" | "Audit";
 
 const EMPTY: Data = {
   health: null,
@@ -186,11 +186,13 @@ const EMPTY: Data = {
 };
 const NAV: { label: Page; group: string; icon: typeof LayoutDashboard }[] = [
   { label: "Overview", group: "Platform", icon: LayoutDashboard },
+  { label: "Prompt Builder", group: "Create", icon: Sparkles },
+  { label: "Workflow", group: "Create", icon: GitBranch },
+  { label: "Saved workflows", group: "Create", icon: FileText },
   { label: "Orchestrator", group: "Run", icon: Terminal },
-  { label: "Registry", group: "Build", icon: Bot },
-  { label: "Workflows", group: "Build", icon: GitBranch },
+  { label: "Agent Registry", group: "Build", icon: Bot },
   { label: "Skills", group: "Build", icon: CircleHelp },
-  { label: "MCP", group: "Build", icon: Server },
+  { label: "MCP Registry", group: "Build", icon: Server },
   { label: "Runs", group: "Run", icon: Activity },
   { label: "Approvals", group: "Govern", icon: ShieldCheck },
   { label: "Audit", group: "Govern", icon: Database },
@@ -202,6 +204,13 @@ class ApiError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+function pageFromLocation(): Page {
+  if (window.location.pathname === "/create/workflow") return "Workflow";
+  if (window.location.pathname === "/create/saved-workflows") return "Saved workflows";
+  if (window.location.pathname === "/create/prompt") return "Prompt Builder";
+  return "Overview";
 }
 
 async function api<T>(
@@ -255,7 +264,13 @@ function statusTone(value: string): string {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>("Overview");
+  const [page, setPage] = useState<Page>(pageFromLocation);
+  const [studioWorkflowId, setStudioWorkflowId] = useState<string | null>(() =>
+    new URLSearchParams(window.location.search).get("workflow"),
+  );
+  const [studioPrompt, setStudioPrompt] = useState<string | null>(() =>
+    new URLSearchParams(window.location.search).get("prompt"),
+  );
   const [mobileMenu, setMobileMenu] = useState(false);
   const [role, setRole] = useState(() => localStorage.getItem("ueoa-role") || "user");
   const [roles, setRoles] = useState<string[]>([]);
@@ -329,6 +344,16 @@ function App() {
     localStorage.setItem("ueoa-role", role);
   }, [role]);
   useEffect(() => {
+    const syncRoute = () => {
+      setPage(pageFromLocation());
+      const params = new URLSearchParams(window.location.search);
+      setStudioWorkflowId(params.get("workflow"));
+      setStudioPrompt(params.get("prompt"));
+    };
+    window.addEventListener("popstate", syncRoute);
+    return () => window.removeEventListener("popstate", syncRoute);
+  }, []);
+  useEffect(() => {
     void refresh().catch((error: unknown) => {
       setLoading(false);
       setRefreshing(false);
@@ -351,8 +376,19 @@ function App() {
   }, [activeRun, refresh, selectedRun?.id]);
 
   const groups = useMemo(() => [...new Set(NAV.map((item) => item.group))], []);
-  const navigate = (next: Page) => {
+  const navigate = (next: Page, workflowId?: string, prompt?: string) => {
     setPage(next);
+    const query = new URLSearchParams();
+    if (workflowId) query.set("workflow", workflowId);
+    if (prompt) query.set("prompt", prompt);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    const path = next === "Workflow"
+      ? `/create/workflow${suffix}`
+      : next === "Saved workflows" ? "/create/saved-workflows"
+        : next === "Prompt Builder" ? "/create/prompt" : "/";
+    setStudioWorkflowId(next === "Workflow" ? workflowId || null : null);
+    setStudioPrompt(next === "Workflow" ? prompt || null : null);
+    if (window.location.href !== new URL(path, window.location.origin).href) window.history.pushState({}, "", path);
     setMobileMenu(false);
   };
 
@@ -462,6 +498,13 @@ function App() {
     });
   }
 
+  async function generateAgentConfiguration(name: string, description: string) {
+    return api<JsonRecord>("/api/v1/agents/generate", role, {
+      method: "POST",
+      body: { name, description },
+    });
+  }
+
   async function saveAgent(definition: JsonRecord, editingId?: string) {
     const saved = await api<JsonRecord>(
       editingId ? `/api/v1/agents/${encodeURIComponent(editingId)}` : "/api/v1/agents",
@@ -476,6 +519,16 @@ function App() {
     }
     await refresh();
     return saved;
+  }
+
+  async function retryAgentRegistration(agentId: string) {
+    try {
+      await api(`/api/v1/agents/${encodeURIComponent(agentId)}/register`, role, { method: "POST" });
+      announce(`Agent ${agentId} registered and approved.`);
+      await refresh();
+    } catch (error) {
+      announce(error instanceof Error ? error.message : String(error), "bad");
+    }
   }
 
   async function removeAgent(agentId: string) {
@@ -570,6 +623,70 @@ function App() {
     }
   }
 
+  async function loadStudioWorkflow(id: string): Promise<WorkflowDocument> {
+    return api<WorkflowDocument>(`/api/v1/workflows/${encodeURIComponent(id)}`, role);
+  }
+
+  async function validateStudioWorkflow(workflow: Workflow): Promise<Validation> {
+    return api<Validation>("/api/v1/workflows/validate", role, { method: "POST", body: { workflow } });
+  }
+
+  async function saveStudioWorkflow(id: string, workflow: Workflow, name: string, description: string): Promise<WorkflowDocument> {
+    const saved = await api<WorkflowDocument>(`/api/v1/workflows/${encodeURIComponent(id)}`, role, {
+      method: "PUT",
+      body: { workflow, name, description },
+    });
+    await refresh();
+    return saved;
+  }
+
+  async function generateStudioWorkflow(goal: string): Promise<{
+    ok: boolean;
+    workflow: Workflow | null;
+    rationale?: string;
+    issues?: string[];
+    considered?: string[];
+  }> {
+    return api<{
+      ok: boolean;
+      workflow: Workflow | null;
+      rationale?: string;
+      issues?: string[];
+      considered?: string[];
+    }>("/api/v1/workflows/draft", role, {
+      method: "POST",
+      body: { goal },
+    });
+  }
+
+  async function generateProfessionalPrompt(brief: PromptBrief): Promise<string> {
+    const result = await api<{ prompt: string }>("/api/v1/workflows/prompt", role, {
+      method: "POST",
+      body: brief,
+    });
+    return result.prompt;
+  }
+
+  async function deleteSavedWorkflow(id: string) {
+    try {
+      await api(`/api/v1/workflows/${encodeURIComponent(id)}`, role, { method: "DELETE" });
+      announce(`Deleted workflow draft ${id}.`);
+      await refresh();
+    } catch (error) {
+      announce(error instanceof Error ? error.message : String(error), "bad");
+    }
+  }
+
+  async function runStudioWorkflow(workflow: Workflow, inputs: JsonRecord): Promise<RunResult> {
+    const run = await api<RunDetail>("/api/v1/runs", role, {
+      method: "POST",
+      body: { workflow, inputs, wait_s: 5 },
+    });
+    setSelectedRun(run);
+    await refresh();
+    return run;
+  }
+
   async function decideApproval(approval: Approval, decision: "approve" | "reject") {
     try {
       await api(`/api/v1/runs/${encodeURIComponent(approval.run_id)}/approvals/${encodeURIComponent(approval.node)}`, role, {
@@ -660,11 +777,42 @@ function App() {
               onViewAudit={viewAudit} onViewApprovals={() => navigate("Approvals")}
             />
           )}
-          {!loading && page === "Registry" && (
+          {!loading && page === "Workflow" && (
+            <WorkflowStudio
+              capabilities={data.capabilities}
+              agents={data.agents}
+              skills={data.skills}
+              mcpServers={data.mcpServers}
+              liveRun={selectedRun}
+              initialWorkflowId={studioWorkflowId}
+              initialPrompt={studioPrompt}
+              onLoad={loadStudioWorkflow}
+              onValidate={validateStudioWorkflow}
+              onSave={saveStudioWorkflow}
+              onDraft={generateStudioWorkflow}
+              onRun={runStudioWorkflow}
+            />
+          )}
+          {!loading && page === "Prompt Builder" && (
+            <PromptBuilder
+              onGenerate={generateProfessionalPrompt}
+              onUsePrompt={(prompt) => navigate("Workflow", undefined, prompt)}
+            />
+          )}
+          {!loading && page === "Saved workflows" && (
+            <SavedWorkflows
+              workflows={data.workflows}
+              onEdit={(id) => navigate("Workflow", id)}
+              onDelete={(id) => void deleteSavedWorkflow(id)}
+              onCreate={() => navigate("Workflow")}
+            />
+          )}
+          {!loading && page === "Agent Registry" && (
             <Registry
               data={data} role={role} registerUrl={registerUrl} setRegisterUrl={setRegisterUrl}
               onRegister={registerImplementation} onApprove={approveImplementation} busy={busy}
               onPreviewAgent={previewAgent} onSaveAgent={saveAgent} onDeleteAgent={removeAgent} onGetAgent={getAgent}
+              onGenerateAgent={generateAgentConfiguration} onRetryAgentRegistration={retryAgentRegistration}
             />
           )}
           {!loading && page === "Workflows" && (
@@ -678,7 +826,7 @@ function App() {
           {!loading && page === "Skills" && (
             <Skills data={data} role={role} onSave={saveSkill} onDelete={removeSkill} />
           )}
-          {!loading && page === "MCP" && (
+          {!loading && page === "MCP Registry" && (
             <MCP servers={data.mcpServers} role={role} busy={busy} onRegister={registerMcpServer} onDelete={removeMcpServer} />
           )}
           {!loading && page === "Runs" && (
@@ -927,6 +1075,8 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
   const [messages, setMessages] = useState<ChatMessage[]>(loaded.messages);
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const [selectedCapabilities, setSelectedCapabilities] = useState<string[]>([]);
+  const [chatText, setChatText] = useState("");
+  const [runInputText, setRunInputText] = useState("{}");
   const [mode, setMode] = useState("");
   const [sending, setSending] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1009,6 +1159,8 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
     setMessages([]);
     setStaged([]);
     setSelectedCapabilities([]);
+    setChatText("");
+    setRunInputText("{}");
     setComposerError("");
     requestByMessage.current.clear();
     onClearRun();
@@ -1072,7 +1224,11 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
       return;
     }
 
-    const text = resend?.text ?? "";
+    const text = resend ? resend.text : chatText.trim();
+    if (!text.trim()) {
+      setComposerError("Type your goal before sending it to the selected workflow.");
+      return;
+    }
     const capabilities = resend?.capabilities ?? selectedCapabilities;
     const documents = resend?.documents ?? staged.map((item) => item.encoded);
     const attachmentMeta = resend?.attachmentMeta ?? staged.map(({ name, size, mediaType }) => ({ name, size, mediaType }));
@@ -1081,12 +1237,26 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
       setComposerError("Wait for the current run to finish before starting another run.");
       return;
     }
+    let additionalInputs: JsonRecord = {};
+    if (!resend) {
+      try {
+        const parsed: unknown = JSON.parse(runInputText);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("Additional workflow inputs must be a JSON object.");
+        }
+        additionalInputs = parsed as JsonRecord;
+      } catch (error) {
+        setComposerError(error instanceof Error ? error.message : "Additional workflow inputs must be valid JSON.");
+        return;
+      }
+    }
     const runInputs = {
+      ...additionalInputs,
       ...(resend?.inputs ?? {}),
       ...(capabilities.length ? { capabilities } : {}),
       ...(documents.length ? { documents } : {}),
     };
-    const displayText = text || `Run workflow: ${workflow.name || workflowId}`;
+    const displayText = text;
     const userMessage: ChatMessage = {
       id: newChatId(), role: "user", text: displayText,
       ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
@@ -1096,7 +1266,7 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
     const assistantId = newChatId();
     const assistantMessage: ChatMessage = {
       id: assistantId, role: "assistant", text: "", stage: "running",
-      statusText: "Starting workflow...",
+      statusText: "Processing your goal with the saved workflow...",
       ...(workflowId ? { workflowId } : {}),
     };
     const request: ChatRequest = { text, inputs: runInputs, attachmentMeta, documents, capabilities };
@@ -1104,13 +1274,17 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setStaged([]);
     setSelectedCapabilities([]);
+    if (!resend) {
+      setChatText("");
+      setRunInputText("{}");
+    }
     setComposerError("");
     setSending(true);
 
     try {
       const run = await api<RunDetail>("/api/v1/runs", role, {
         method: "POST",
-        body: { workflow_id: workflowId, inputs: runInputs, wait_s: 0 },
+        body: { workflow_id: workflowId, goal: text, inputs: runInputs, wait_s: 0 },
       });
       onSelectedRun(run);
       updateMessage(assistantId, (message) => ({
@@ -1118,7 +1292,7 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
           CHAT_TERMINAL_FAILURES.has(run.status) ? "failed" : "running",
         statusText: run.status === "completed" ? "Completed" :
           CHAT_TERMINAL_FAILURES.has(run.status) ? "Run failed" : "Running...",
-        ...(workflowId ? { plan: { workflow: run.workflow, rationale: run.plan?.rationale || "Saved workflow" } } : {}),
+        ...(workflowId ? { plan: { workflow: run.workflow, rationale: run.plan?.rationale || `Running saved workflow for: ${text}` } } : {}),
       }));
     } catch (error) {
       const reason = apiErrorText(error);
@@ -1131,7 +1305,7 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
   }
 
   async function copyResult(run: RunDetail) {
-    const result = resultMarkdown(run.outputs) ?? pretty(run.outputs);
+    const result = resultMarkdown(run.outputs) ?? resultText(run.outputs) ?? pretty(run.outputs);
     try {
       await navigator.clipboard.writeText(result);
       setCopyStatus("Result copied.");
@@ -1212,6 +1386,12 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
                   </button>;
                 }) : <small className="capability-picker-empty">No capabilities are available.</small>}
               </div>
+              <label className="additional-input-editor">
+                <b>Workflow inputs (JSON)</b>
+                <textarea value={runInputText} onChange={(event) => setRunInputText(event.target.value)} rows={5}
+                  aria-label="Additional workflow inputs" placeholder='{"customer_id":"123"}' spellCheck={false} />
+                <small>Extra values your saved workflow expects.</small>
+              </label>
             </div>}
             <input ref={fileInputRef} type="file" className="visually-hidden" accept=".pdf,.txt,.md,.csv,.json" multiple
               aria-label="Choose attachments" onChange={(event) => {
@@ -1220,19 +1400,28 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
               }} />
           </div>
           <div className="composer-form">
+            <textarea className="goal-composer" aria-label="Workflow goal"
+              placeholder="Describe what you want the selected workflow to do…"
+              value={chatText} rows={2} onChange={(event) => setChatText(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }} />
             <div className="composer-controls">
               <select aria-label="Saved workflow" value={mode} onChange={(event) => setMode(event.target.value)}>
                 {!data.workflows.length && <option value="">No saved workflows</option>}
-                {data.workflows.map((workflow) => <option value={`workflow:${workflow.id}`} key={workflow.id}>Workflow: {workflow.id}</option>)}
+                {data.workflows.map((workflow) => <option value={`workflow:${workflow.id}`} key={workflow.id}>{workflow.name || workflow.id}</option>)}
               </select>
-              <button type="button" className="primary-button send-button" disabled={sending || !mode}
+              <button type="button" className="primary-button send-button" disabled={sending || !mode || !chatText.trim()}
                 onClick={() => void sendMessage()}>
                 {sending ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />} Send
               </button>
             </div>
           </div>
         </div>
-        <p className="composer-hint">Files populate <code>documents</code>; selected capabilities are included in workflow inputs.</p>
+        <p className="composer-hint">Type a goal, choose a saved workflow, and press Enter or Send. Use + for files, capabilities, and extra workflow inputs.</p>
       </div>
     </section>
   );
@@ -1310,9 +1499,19 @@ function resultMarkdown(outputs: unknown): string | null {
   return findMarkdown(outputs);
 }
 
+function resultText(outputs: unknown): string | null {
+  if (!isRecord(outputs)) return null;
+  for (const key of ["code_snippet", "result", "answer", "text"]) {
+    if (typeof outputs[key] === "string") return outputs[key];
+  }
+  const textValues = Object.values(outputs).filter((value): value is string => typeof value === "string");
+  return textValues.length === 1 ? textValues[0] : null;
+}
+
 function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy: () => void; onViewAudit: () => void }) {
   const outputs = isRecord(run.outputs) ? run.outputs : {};
   const markdown = resultMarkdown(run.outputs);
+  const text = resultText(run.outputs);
   const highlights = Array.isArray(outputs.highlights) ? outputs.highlights : [];
   const actions = Array.isArray(outputs.action_items) ? outputs.action_items : [];
   const completed = run.status === "completed";
@@ -1329,7 +1528,9 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
     : run.error || "The run failed.";
   return <div className="assistant-result">
     {completed && <div className="result-body">
-      {markdown ? <Markdown source={markdown} /> : <pre className="json-output">{pretty(run.outputs)}</pre>}
+      {markdown ? <Markdown source={markdown} /> : text !== null
+        ? <pre className="markdown-code"><code>{text}</code></pre>
+        : <pre className="json-output">{pretty(run.outputs)}</pre>}
       {highlights.length > 0 && <section><h4>Highlights</h4><ul>{highlights.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
       {actions.length > 0 && <section><h4>Action items</h4><ul>{actions.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
     </div>}
@@ -1342,7 +1543,7 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
 }
 
 function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onApprove, busy,
-  onPreviewAgent, onSaveAgent, onDeleteAgent, onGetAgent,
+  onPreviewAgent, onSaveAgent, onDeleteAgent, onGetAgent, onGenerateAgent, onRetryAgentRegistration,
 }: {
   data: Data; role: string; registerUrl: string; setRegisterUrl: (value: string) => void;
   onRegister: (event: FormEvent<HTMLFormElement>) => void; onApprove: (key: string) => void; busy: boolean;
@@ -1350,9 +1551,11 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
   onSaveAgent: (definition: JsonRecord, editingId?: string) => Promise<JsonRecord>;
   onDeleteAgent: (agentId: string) => void;
   onGetAgent: (agentId: string) => Promise<JsonRecord>;
+  onGenerateAgent: (name: string, description: string) => Promise<JsonRecord>;
+  onRetryAgentRegistration: (agentId: string) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [registrationMode, setRegistrationMode] = useState<"automatic" | "manual">("automatic");
+  const [registrationMode, setRegistrationMode] = useState<"describe" | "automatic" | "manual">("describe");
   const [editorOpen, setEditorOpen] = useState(false);
   const [preview, setPreview] = useState<JsonRecord | null>(null);
   const [detailAgent, setDetailAgent] = useState<JsonRecord | null>(null);
@@ -1360,6 +1563,10 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
   const [editingId, setEditingId] = useState<string | undefined>();
   const [editorBusy, setEditorBusy] = useState(false);
   const [editorError, setEditorError] = useState("");
+  const [generationName, setGenerationName] = useState("");
+  const [generationPrompt, setGenerationPrompt] = useState("");
+  const [generationError, setGenerationError] = useState("");
+  const [generationBusy, setGenerationBusy] = useState(false);
   const [agentName, setAgentName] = useState("");
   const [agentId, setAgentId] = useState("");
   const [agentDescription, setAgentDescription] = useState("");
@@ -1478,6 +1685,36 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
     }
   }
 
+  async function generateDefinition(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setGenerationBusy(true);
+    setGenerationError("");
+    try {
+      const generated = await onGenerateAgent(generationName, generationPrompt);
+      const capability = generated.capability as JsonRecord;
+      setEditingId(undefined);
+      setAgentId(String(generated.id || ""));
+      setAgentName(String(generated.name || generationName));
+      setAgentDescription(String(generated.description || generationPrompt));
+      setAgentOwner(String(generated.owner || "platform"));
+      setCapabilityId(String(capability.id || ""));
+      setCapabilityDescription(String(capability.description || ""));
+      setUseWhen(String(capability.use_when || ""));
+      setInstructions(String(generated.instructions || ""));
+      setTimeoutSeconds(Number(generated.timeout_s) || 90);
+      setInputSchema(pretty(generated.input_schema));
+      setOutputSchema(pretty(generated.output_schema));
+      setPreview(null);
+      setEditorError("");
+      setEditorOpen(true);
+      setRegistrationMode("manual");
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setGenerationBusy(false);
+    }
+  }
+
   async function submitDefinition() {
     setEditorBusy(true);
     setEditorError("");
@@ -1504,6 +1741,9 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
           <div className="implementation-meta"><span>Capability: {agent.capability}</span><span>Template: {agent.template}</span>
             {agent.fields.length > 0 && <span>Fields: {agent.fields.join(", ")}</span>}</div>
           <div className="form-actions">
+            {role === "admin" && agent.implementation?.status !== "approved" && <button className="secondary-button compact" onClick={() => onRetryAgentRegistration(agent.id)}>
+              <Activity size={14} /> Retry registration
+            </button>}
             <button className="text-button" onClick={() => void (async () => {
               setDetailError("");
               try {
@@ -1536,10 +1776,23 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
       </section>
       <section className="panel"><div className="panel-heading"><div><h2>Register an agent</h2><p>Use a published A2A card or create a model-backed hosted agent.</p></div></div>
         <div className="tab-row" role="tablist" aria-label="Agent registration method">
+          <button type="button" className={`tab-button ${registrationMode === "describe" ? "selected" : ""}`} onClick={() => setRegistrationMode("describe")}><Sparkles size={14} /> Describe with AI</button>
           <button type="button" className={`tab-button ${registrationMode === "automatic" ? "selected" : ""}`} onClick={() => setRegistrationMode("automatic")}>Automatic · A2A discovery</button>
           <button type="button" className={`tab-button ${registrationMode === "manual" ? "selected" : ""}`} onClick={() => setRegistrationMode("manual")}>Manual · Hosted agent</button>
         </div>
-        {registrationMode === "automatic" ? <form className="register-form" onSubmit={(event) => void onRegister(event)}>
+        {registrationMode === "describe" ? <form className="register-form agent-generate-form" onSubmit={(event) => void generateDefinition(event)}>
+          <p className="muted registration-help">Name the agent and describe its role, goals, and behavior. The configured server-side LLM generates a draft configuration for review; nothing is saved until you confirm.</p>
+          {role !== "admin" && <div className="error-box">Switch to the admin role to generate or register agents.</div>}
+          <label className="field-label" htmlFor="agent-generation-name">Agent name</label>
+          <input id="agent-generation-name" value={generationName} onChange={(event) => setGenerationName(event.target.value)} required maxLength={80} placeholder="e.g. Sales Research Assistant" />
+          <label className="field-label" htmlFor="agent-generation-prompt">Describe the agent</label>
+          <textarea id="agent-generation-prompt" className="goal-input" value={generationPrompt} onChange={(event) => setGenerationPrompt(event.target.value)} required maxLength={2000}
+            placeholder="Describe its role, goals, expected inputs, output, and behavior…" />
+          {generationError && <div className="error-box">{generationError}</div>}
+          <div className="form-actions"><span className="muted">Uses the LLM configured on the server. API keys stay server-side.</span>
+            <button type="submit" className="primary-button" disabled={generationBusy || role !== "admin"}>{generationBusy ? <LoaderCircle size={15} className="spin" /> : <Sparkles size={15} />} Generate agent draft</button>
+          </div>
+        </form> : registrationMode === "automatic" ? <form className="register-form" onSubmit={(event) => void onRegister(event)}>
           <p className="muted registration-help">Fetches <code>/.well-known/agent-card.json</code> (or a provided JSON card URL), validates its UEOA metadata and conformance, then registers it. The API allow-list and SSRF checks apply.</p>
           <label className="field-label" htmlFor="agent-url">Agent endpoint or card URL</label>
           <div className="inline-form"><input id="agent-url" type="url" required value={registerUrl} onChange={(event) => setRegisterUrl(event.target.value)} placeholder="https://agent.example.com" />
@@ -1760,6 +2013,149 @@ function MCP({ servers, role, busy, onRegister, onDelete }: {
   );
 }
 
+function PromptBuilder({ onGenerate, onUsePrompt }: {
+  onGenerate: (brief: PromptBrief) => Promise<string>;
+  onUsePrompt: (prompt: string) => void;
+}) {
+  const [brief, setBrief] = useState<PromptBrief>({
+    description: "",
+    audience: "",
+    inputs: "",
+    steps: "",
+    constraints: "",
+    output: "",
+  });
+  const [prompt, setPrompt] = useState("");
+  const [working, setWorking] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [copied, setCopied] = useState(false);
+  const update = (key: keyof PromptBrief, value: string) => setBrief((current) => ({ ...current, [key]: value }));
+
+  async function generate() {
+    if (brief.description.trim().length < 10) {
+      setNotice("Describe the work in at least 10 characters so the prompt can be specific.");
+      return;
+    }
+    setWorking(true);
+    setNotice("");
+    setCopied(false);
+    try {
+      setPrompt(await onGenerate(brief));
+      setNotice("Professional prompt generated. Review it, then use it to create a workflow.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function copyPrompt() {
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(true);
+      setNotice("Prompt copied.");
+    } catch {
+      setNotice("Clipboard access was denied. Select and copy the prompt text manually.");
+    }
+  }
+
+  return (
+    <div className="prompt-builder">
+      <section className="panel prompt-builder-intro">
+        <p className="eyebrow">CREATE / PROMPT BUILDER</p>
+        <h2>Turn your idea into a professional workflow brief</h2>
+        <p>Describe the task and requirements. Azure OpenAI will organize them into a clear prompt you can send to the workflow generator.</p>
+      </section>
+      <div className="prompt-builder-grid">
+        <section className="panel">
+          <div className="panel-heading"><div><h2>Describe your work</h2><p>Specific requirements help create a better workflow.</p></div></div>
+          <label className="field-label" htmlFor="prompt-purpose">What should the workflow accomplish? *</label>
+          <textarea id="prompt-purpose" className="goal-input" value={brief.description}
+            onChange={(event) => update("description", event.target.value)}
+            placeholder="Describe the job, desired result, and how success should be measured." />
+          <label className="field-label" htmlFor="prompt-audience">Who or what is it for?</label>
+          <textarea id="prompt-audience" className="prompt-input" value={brief.audience}
+            onChange={(event) => update("audience", event.target.value)}
+            placeholder="Users, customers, teams, systems, or audience." />
+          <label className="field-label" htmlFor="prompt-inputs">Inputs and references</label>
+          <textarea id="prompt-inputs" className="prompt-input" value={brief.inputs}
+            onChange={(event) => update("inputs", event.target.value)}
+            placeholder="Files, fields, records, or context the workflow receives." />
+          <label className="field-label" htmlFor="prompt-steps">Process or key steps</label>
+          <textarea id="prompt-steps" className="prompt-input" value={brief.steps}
+            onChange={(event) => update("steps", event.target.value)}
+            placeholder="Checks, decisions, analysis, or ordering requirements." />
+          <label className="field-label" htmlFor="prompt-constraints">Rules and constraints</label>
+          <textarea id="prompt-constraints" className="prompt-input" value={brief.constraints}
+            onChange={(event) => update("constraints", event.target.value)}
+            placeholder="Permissions, policies, exclusions, or safety requirements." />
+          <label className="field-label" htmlFor="prompt-output">Expected output</label>
+          <textarea id="prompt-output" className="prompt-input" value={brief.output}
+            onChange={(event) => update("output", event.target.value)}
+            placeholder="Format, fields, tone, and level of detail." />
+          <div className="form-actions">
+            <button type="button" className="primary-button" disabled={working || brief.description.trim().length < 10} onClick={() => void generate()}>
+              {working ? <LoaderCircle size={15} className="spin" /> : <Sparkles size={15} />}
+              {working ? "Creating prompt…" : "Create professional prompt"}
+            </button>
+          </div>
+          {notice && <p className={`prompt-notice ${notice.includes("denied") ? "bad" : ""}`} role="status">{notice}</p>}
+        </section>
+        <section className="panel prompt-result-panel">
+          <div className="panel-heading"><div><h2>Workflow prompt</h2><p>Review or edit the prompt before sending it to the workflow studio.</p></div></div>
+          <textarea className="prompt-result" aria-label="Generated professional prompt" value={prompt}
+            onChange={(event) => setPrompt(event.target.value)} placeholder="Your professional prompt will appear here." />
+          <div className="form-actions">
+            <button type="button" className="secondary-button" disabled={!prompt.trim()} onClick={() => void copyPrompt()}>
+              <Copy size={14} /> {copied ? "Copied" : "Copy prompt"}
+            </button>
+            <button type="button" className="primary-button" disabled={!prompt.trim()} onClick={() => onUsePrompt(prompt.trim())}>
+              <GitBranch size={14} /> Use prompt in workflow
+            </button>
+          </div>
+          <div className="prompt-tip"><CircleHelp size={15} /><span>The workflow generator can only use capabilities that are registered and approved in this project. It will show which capabilities are missing instead of inventing steps.</span></div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function SavedWorkflows({ workflows, onEdit, onDelete, onCreate }: {
+  workflows: WorkflowSummary[];
+  onEdit: (id: string) => void;
+  onDelete: (id: string) => void;
+  onCreate: () => void;
+}) {
+  const saved = workflows.filter((workflow) => !workflow.builtin && !workflow.published);
+  return (
+    <section className="panel saved-workflows">
+      <div className="panel-heading">
+        <div><h2>Saved workflows</h2><p>Continue editing drafts you saved, or create a new workflow.</p></div>
+        <button className="primary-button compact" onClick={onCreate}><Plus size={14} /> Create workflow</button>
+      </div>
+      {!saved.length
+        ? <div className="empty-state"><GitBranch size={22} /><b>No saved workflows yet</b><span>Create a workflow, then choose Save draft or Save workflow.</span></div>
+        : <div className="saved-workflow-list">{saved.map((workflow) => (
+          <article className="saved-workflow-card" key={workflow.id}>
+            <div className="saved-workflow-info">
+              <div><GitBranch size={16} /><h3>{workflow.name || workflow.id}</h3>
+                <span className={`status ${workflow.valid ? "good" : "warn"}`}>{workflow.valid ? "Ready to test" : "Draft · needs work"}</span>
+              </div>
+              <p>{workflow.description || "No description provided."}</p>
+              <small>{workflow.nodes ?? 0} steps · Updated {formatTime(workflow.updated_at)} · {workflow.id}{workflow.version ? `@${workflow.version}` : ""}</small>
+            </div>
+            <div className="saved-workflow-actions">
+              <button className="secondary-button compact" onClick={() => onEdit(workflow.id)}><GitBranch size={14} /> Continue editing</button>
+              <button className="icon-button danger-icon" aria-label={`Delete ${workflow.name || workflow.id}`} title="Delete workflow" onClick={() => {
+                if (window.confirm(`Delete workflow "${workflow.name || workflow.id}"? This cannot be undone.`)) onDelete(workflow.id);
+              }}><Trash2 size={15} /></button>
+            </div>
+          </article>
+        ))}</div>}
+    </section>
+  );
+}
+
 function Workflows({ data, inputsText, setInputsText, draftGoal, setDraftGoal, draft, workflowName, setWorkflowName, busy, onDraft, onSave, onRun }: {
   data: Data; inputsText: string; setInputsText: (value: string) => void; draftGoal: string; setDraftGoal: (value: string) => void; draft: JsonRecord | null;
   workflowName: string; setWorkflowName: (value: string) => void; busy: boolean;
@@ -1772,7 +2168,7 @@ function Workflows({ data, inputsText, setInputsText, draftGoal, setDraftGoal, d
         {data.workflows.length ? <div className="workflow-list">{data.workflows.map((workflow) => <article className="workflow-card" key={workflow.id}>
           <div className="workflow-card-main"><div className="workflow-icon"><GitBranch size={17} /></div><div><h3>{workflow.name || workflow.id}</h3><code>{workflow.id}</code>
             <p>{workflow.description || "No description provided."}</p><div className="tag-row"><span className="tag">{workflow.nodes} nodes</span>
-              <span className="tag">{workflow.capabilities.length} capabilities</span><Status value={workflow.valid ? "valid" : "invalid"} /></div></div></div>
+              <span className="tag">{(workflow.capabilities || []).length} capabilities</span><Status value={workflow.valid ? "valid" : "invalid"} /></div></div></div>
           <button className="secondary-button compact" onClick={() => onRun(workflow.id)}><Play size={14} /> Run</button>
         </article>)}</div> : <EmptyState text="No workflow templates have been saved." /> }
         <label className="field-label" htmlFor="workflow-inputs">Inputs for workflow run</label>

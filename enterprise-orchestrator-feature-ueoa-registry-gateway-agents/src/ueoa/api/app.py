@@ -6,8 +6,9 @@ No `from __future__ import annotations` here: FastAPI must evaluate `Depends(...
 import importlib
 import logging
 import os
+import re
 import ssl
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,7 +27,7 @@ from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ueoa.api.mcp import create_mcp_router, origin_allowed
-from ueoa.contracts import Effect, NodeType, WorkflowSpec
+from ueoa.contracts import CapabilityContract, Effect, InputSpec, NodeType, WorkflowSpec
 from ueoa.gateway.auth import EntraTokenProvider, StaticTokenProvider, TokenProvider
 from ueoa.gateway.invokers import Invoker
 from ueoa.gateway.service import (
@@ -37,7 +38,9 @@ from ueoa.gateway.service import (
     InvocationRecord,
     Principal,
 )
-from ueoa.llm import FoundationLLM, FoundationSettings, JsonLLM, LLMError
+from ueoa.llm import AzureOpenAIJsonLLM, JsonLLM, LLMError
+from ueoa.orchestrator.expressions import ExpressionError, parse, references
+from ueoa.orchestrator.graph import node_expressions
 from ueoa.orchestrator.planner import Planner
 from ueoa.orchestrator.runner import PendingApproval, Run, RunController, RunError
 from ueoa.registry.models import DEFAULT_ENTRA_SCOPE, Implementation, ImplementationStatus
@@ -90,7 +93,7 @@ class Settings:
     )
     # How agents hosted by this platform are addressed in their cards (must be reachable by the gateway).
     public_base_url: str = field(
-        default_factory=lambda: os.environ.get("UEOA_PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+        default_factory=lambda: os.environ.get("UEOA_PUBLIC_BASE_URL", "").rstrip("/")
     )
 
 
@@ -258,6 +261,197 @@ class RunRequest(BaseModel):
     wait_s: float = Field(default=0, ge=0, le=300)
 
 
+_GOAL_INPUT_NAMES = (
+    "goal",
+    "prompt",
+    "user_prompt",
+    "query",
+    "request",
+    "user_request",
+    "task",
+    "task_description",
+    "code_request",
+    "instruction",
+    "user_input",
+    "input_text",
+    "text",
+    "message",
+    "description",
+    "objective",
+    "requirements",
+    "requirement",
+    "question",
+    "content",
+    "input",
+)
+_GOAL_HINTS = frozenset(
+    {
+        "goal",
+        "prompt",
+        "query",
+        "request",
+        "task",
+        "instruction",
+        "input",
+        "text",
+        "message",
+        "description",
+        "objective",
+        "requirement",
+        "question",
+        "content",
+        "code",
+    }
+)
+
+
+def _is_string_field(field: Any) -> bool:
+    field_type = field.type if isinstance(field, InputSpec) else field.get("type") if isinstance(field, dict) else None
+    return field_type == "string" or (isinstance(field_type, list) and "string" in field_type)
+
+
+def _select_goal_field(fields: dict[str, Any], required: set[str] | None = None) -> str | None:
+    string_fields = {name: field for name, field in fields.items() if _is_string_field(field)}
+    for name in _GOAL_INPUT_NAMES:
+        if name in string_fields:
+            return name
+    if len(string_fields) == 1:
+        return next(iter(string_fields))
+    if required:
+        required_strings = [name for name in string_fields if name in required]
+        if len(required_strings) == 1:
+            return required_strings[0]
+
+    def score(name: str, field: Any) -> int:
+        description = field.description if isinstance(field, InputSpec) else field.get("description", "")
+        words = set(re.findall(r"[a-z0-9]+", f"{name} {description}".lower()))
+        return len(words & _GOAL_HINTS)
+
+    scored = [(score(name, field), name) for name, field in string_fields.items()]
+    if not scored:
+        return None
+    highest = max(value for value, _ in scored)
+    best = [name for value, name in scored if value == highest and value > 0]
+    return best[0] if len(best) == 1 else None
+
+
+def _workflow_goal_inputs(spec: WorkflowSpec, goal: str, inputs: dict[str, Any]) -> dict[str, Any]:
+    """Bind the chat goal to a declared workflow input without changing saved workflow definitions."""
+    target = next((name for name in _GOAL_INPUT_NAMES if name in spec.inputs), None)
+    if target is None:
+        target = _select_goal_field(spec.inputs)
+    if target is None:
+        object_inputs = [name for name, declaration in spec.inputs.items() if declaration.type == "object"]
+        if len(spec.inputs) == 1 or (
+            len(object_inputs) == 1 and not any(_is_string_field(declaration) for declaration in spec.inputs.values())
+        ):
+            target = object_inputs[0] if object_inputs else None
+    if target is None:
+        available = ", ".join(spec.inputs) or "(none)"
+        raise HTTPException(
+            422,
+            "Could not identify a text input for the chat goal in this workflow. "
+            f"Declared inputs: {available}. Rename the task field to a goal/prompt/request field "
+            "or provide an unambiguous text field in Workflow inputs (JSON).",
+        )
+
+    declaration: InputSpec = spec.inputs[target]
+    if declaration.type != "object":
+        if declaration.type != "string":
+            raise HTTPException(422, f"Workflow input '{target}' must be a string or an object to receive the goal.")
+        return {**inputs, target: goal}
+
+    schema = declaration.model_extra or {}
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    property_name = next((name for name in _GOAL_INPUT_NAMES if name in properties), None)
+    if property_name is None:
+        required = schema.get("required", [])
+        property_name = _select_goal_field(properties, set(required) if isinstance(required, list) else None)
+    if property_name is None and schema.get("additionalProperties", True) is not False:
+        property_name = "goal"
+    if property_name is None:
+        available = ", ".join(properties) or "(none)"
+        raise HTTPException(
+            422,
+            f"Workflow input '{target}' has no unambiguous string field for the chat goal. "
+            f"Declared fields: {available}. Add a goal/prompt/request field.",
+        )
+    existing = inputs.get(target, {})
+    if not isinstance(existing, dict):
+        raise HTTPException(422, f"Workflow input '{target}' must be a JSON object to receive the goal.")
+    return {**inputs, target: {**existing, property_name: goal}}
+
+
+def _referenced_workflow_inputs(spec: WorkflowSpec) -> set[str]:
+    found: set[str] = set()
+    expressions = [expression.source for node in spec.nodes for expression in node_expressions(node)]
+    expressions.extend(spec.outputs.values())
+    for expression in expressions:
+        try:
+            found.update(
+                str(use.ref.path[0])
+                for use in references(parse(expression))
+                if use.ref.root == "inputs" and use.ref.path
+            )
+        except ExpressionError:
+            continue
+    return found
+
+
+def _prepare_saved_workflow(
+    spec: WorkflowSpec,
+    goal: str,
+    inputs: dict[str, Any],
+    capabilities: Mapping[str, CapabilityContract],
+) -> tuple[WorkflowSpec, dict[str, Any]]:
+    """Bind the chat goal and omit unset optional tool arguments from this run only."""
+    spec = spec.model_copy(deep=True)
+    run_inputs = _workflow_goal_inputs(spec, goal, inputs)
+    missing = {
+        name
+        for name, declaration in spec.inputs.items()
+        if name not in run_inputs and "default" not in declaration.model_fields_set
+    }
+
+    for node in spec.nodes:
+        if node.type is not NodeType.CAPABILITY or not node.capability:
+            continue
+        capability = capabilities.get(node.capability)
+        if capability is None:
+            continue
+        schema = capability.input_schema
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
+        if not isinstance(properties, dict):
+            continue
+        for input_name, binding in list(node.inputs.items()):
+            if not isinstance(binding, str):
+                continue
+            try:
+                used_inputs = {
+                    str(use.ref.path[0])
+                    for use in references(parse(binding))
+                    if use.ref.root == "inputs" and use.ref.path
+                }
+            except ExpressionError:
+                continue
+            if used_inputs & missing and input_name in properties and input_name not in required:
+                node.inputs.pop(input_name)
+
+    still_required = missing & _referenced_workflow_inputs(spec)
+    if still_required:
+        raise HTTPException(422, f"workflow inputs required for this task: {', '.join(sorted(still_required))}")
+    referenced = _referenced_workflow_inputs(spec)
+    spec.inputs = {
+        name: declaration
+        for name, declaration in spec.inputs.items()
+        if name not in missing or name in referenced
+    }
+    return spec, run_inputs
+
+
 class HumanInputRequest(BaseModel):
     value: dict[str, Any]
 
@@ -370,18 +564,26 @@ def _build_planner(settings: Settings, llm: JsonLLM | None, client: httpx.AsyncC
     if not settings.planner_enabled:
         return None
     try:
-        return Planner(FoundationLLM(FoundationSettings.from_env(), agent_name="ueoa-planner", http=client))
+        if azure_llm := AzureOpenAIJsonLLM.from_env(client):
+            return Planner(azure_llm)
     except LLMError:
+        logger.exception("Azure OpenAI configuration is invalid")
         return None
+    logger.warning("Azure OpenAI API key is not configured; workflow planning is unavailable")
+    return None
 
 
 def _build_agent_llm(llm: JsonLLM | None, client: httpx.AsyncClient) -> JsonLLM | None:
     if llm is not None:
         return llm
     try:
-        return FoundationLLM(FoundationSettings.from_env(), agent_name="ueoa-hosted-agent", http=client)
+        if azure_llm := AzureOpenAIJsonLLM.from_env(client):
+            return azure_llm
     except LLMError:
+        logger.exception("Azure OpenAI configuration is invalid")
         return None
+    logger.warning("Azure OpenAI API key is not configured; AI agent generation is unavailable")
+    return None
 
 
 def _optional_module(name: str) -> Any:
@@ -452,6 +654,18 @@ def create_app(
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC / "index.html")
+
+    @app.get("/create/workflow", include_in_schema=False)
+    def workflow_studio() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC / "index.html")
+
+    @app.get("/create/saved-workflows", include_in_schema=False)
+    def saved_workflows() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC / "index.html")
+
+    @app.get("/create/prompt", include_in_schema=False)
+    def prompt_builder() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC / "index.html")
 
     @app.get("/api/v1/roles")
@@ -624,7 +838,11 @@ def create_app(
     def require_planner() -> Planner:
         planner = services().planner
         if planner is None:
-            raise HTTPException(503, "planner is not configured (set the UEOA_LLM_* settings)")
+            raise HTTPException(
+                503,
+                "Azure OpenAI is not configured for this server process. "
+                "Set AZURE_OPENAI_API_KEY and restart the server.",
+            )
         return planner
 
     @app.post("/api/v1/plans")
@@ -651,19 +869,23 @@ def create_app(
     async def start_run(  # pyright: ignore[reportUnusedFunction]
         body: RunRequest, who: Annotated[Principal, Depends(principal)]
     ) -> dict[str, Any]:
-        if sum(x is not None for x in (body.goal, body.workflow, body.workflow_id)) != 1:
-            raise HTTPException(422, "give exactly one of 'goal', 'workflow' or 'workflow_id'")
+        if body.workflow_id is None and sum(x is not None for x in (body.goal, body.workflow)) != 1:
+            raise HTTPException(422, "give exactly one of 'goal' or 'workflow', or provide a 'workflow_id'")
+        if body.workflow_id is not None and body.workflow is not None:
+            raise HTTPException(422, "do not provide both 'workflow_id' and 'workflow'")
         svc = services()
         if body.workflow_id is not None:
             try:
-                template = svc.store.get("workflows", body.workflow_id)
+                template = svc.store.get("workflows", body.workflow_id) or svc.store.get(
+                    "workflow-versions", body.workflow_id
+                )
             except ValueError:
                 template = None
             if template is None:
                 raise HTTPException(404, f"unknown workflow '{body.workflow_id}'")
             body.workflow = template["workflow"]
         available = available_capabilities(svc, who, include_writes=body.workflow is not None)
-        if body.goal is not None:
+        if body.goal is not None and body.workflow_id is None:
             planned = await require_planner().plan(body.goal, body.inputs, svc.registry.capabilities, available)
             if not planned.ok or planned.spec is None:
                 raise HTTPException(422, planned.view())
@@ -682,9 +904,22 @@ def create_app(
                 spec = WorkflowSpec.model_validate(body.workflow)
             except ValidationError as exc:
                 raise HTTPException(422, exc.errors(include_url=False, include_context=False)) from exc
-            meta = {"goal": spec.goal, "rationale": "", "attempts": 0, "considered": [], "planned_by": "user"}
             if body.workflow_id is not None:
+                if body.goal is not None:
+                    spec, body.inputs = _prepare_saved_workflow(
+                        spec, body.goal, body.inputs, svc.registry.capabilities
+                    )
+                    spec.goal = body.goal
+                meta = {
+                    "goal": body.goal or spec.goal,
+                    "rationale": "Saved workflow selected by the user.",
+                    "attempts": 0,
+                    "considered": [],
+                    "planned_by": "saved_workflow",
+                }
                 meta["workflow_id"] = body.workflow_id
+            else:
+                meta = {"goal": spec.goal, "rationale": "", "attempts": 0, "considered": [], "planned_by": "user"}
         meta["routing"] = routing_view(svc, who, spec, available, meta["considered"])
         capability_nodes = [n for n in spec.nodes if n.type is NodeType.CAPABILITY and n.capability]
         blocked = sorted({n.capability for n in capability_nodes if n.capability not in available})

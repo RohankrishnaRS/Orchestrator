@@ -26,6 +26,31 @@ ECHO_CONTRACT: dict[str, Any] = {
     "output_schema": TEXT_SCHEMA,
     "samples": [{"text": "hello"}],
 }
+CODE_CONTRACT: dict[str, Any] = {
+    "id": "code.generate",
+    "version": "1.0.0",
+    "description": "Generate code for a requested task.",
+    "effects": "read",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_description": {"type": "string"},
+            "required_libraries": {"type": "array", "items": {"type": "string"}},
+            "expected_input": {"type": "string"},
+            "expected_output": {"type": "string"},
+            "constraints": {"type": "string"},
+        },
+        "required": ["task_description"],
+        "additionalProperties": False,
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {"code_snippet": {"type": "string"}, "explanation": {"type": "string"}},
+        "required": ["code_snippet", "explanation"],
+        "additionalProperties": False,
+    },
+    "samples": [{"task_description": "Write code."}],
+}
 WRITE_CONTRACT: dict[str, Any] = {**ECHO_CONTRACT, "id": "record.write", "effects": "write"}
 ECHO_CARD: dict[str, Any] = {
     "name": "Echo Agent",
@@ -49,6 +74,29 @@ ECHO_CARD: dict[str, Any] = {
         ]
     },
     "skills": [{"id": "echo", "name": "Echo", "description": "Echo text"}],
+}
+CODE_CARD: dict[str, Any] = {
+    **ECHO_CARD,
+    "name": "Code Agent",
+    "description": "Generates code for user requests.",
+    "capabilities": {
+        "extensions": [
+            {
+                "uri": UEOA_EXTENSION_URI,
+                "params": {
+                    "id": "code-agent",
+                    "owner": "platform-tests",
+                    "kind": "agent",
+                    "implementation": "deterministic",
+                    "binding": "a2a",
+                    "implements": ["code.generate@1"],
+                    "effects": "read",
+                    "timeout_s": 5,
+                },
+            }
+        ]
+    },
+    "skills": [{"id": "code", "name": "Code", "description": "Generate code"}],
 }
 WORKFLOW: dict[str, Any] = {
     "id": "echo-flow",
@@ -80,6 +128,13 @@ class ScriptedLLM:
 
 async def _echo(payload: dict[str, Any], _ctx: InvocationContext) -> dict[str, Any]:
     return {"text": payload["text"]}
+
+
+async def _generate_code(payload: dict[str, Any], _ctx: InvocationContext) -> dict[str, Any]:
+    return {
+        "code_snippet": "def add(a, b):\n    return a + b",
+        "explanation": f"Generated for: {payload['task_description']}",
+    }
 
 
 def _client(planner_llm: ScriptedLLM | None, *, planner_enabled: bool = True) -> Iterator[TestClient]:
@@ -138,6 +193,157 @@ def test_run_from_workflow_and_long_poll(client: TestClient) -> None:
     assert run["workflow"]["nodes"][0]["timeout_s"] == 20  # card timeout 5s + 15s headroom
     final = client.get(f"/api/v1/runs/{run['id']}", params={"wait_s": 10}, headers=USER).json()
     assert (final["status"], final["outputs"]) == ("completed", {"text": "hi"})
+
+
+def test_saved_workflow_runs_the_chat_goal_using_declared_input(client: TestClient) -> None:
+    workflow = {**WORKFLOW, "allowed_tasks": ["text.echo"]}
+    saved = client.put(
+        "/api/v1/workflows/echo-flow",
+        json={"name": "Echo goal", "workflow": workflow},
+        headers=USER,
+    )
+    assert saved.status_code == 200, saved.text
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"workflow_id": "echo-flow", "goal": "echo this goal", "wait_s": 10},
+        headers=USER,
+    )
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "completed"
+    assert run["outputs"] == {"text": "echo this goal"}
+    assert run["goal"] == "echo this goal"
+    assert run["plan"]["planned_by"] == "saved_workflow"
+
+
+def test_saved_workflow_maps_chat_goal_into_object_input(client: TestClient) -> None:
+    workflow = copy.deepcopy(WORKFLOW)
+    workflow["allowed_tasks"] = ["text.echo"]
+    workflow["inputs"] = {
+        "input": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+    }
+    workflow["nodes"][0]["inputs"]["text"] = "$inputs.input.text"
+    saved = client.put(
+        "/api/v1/workflows/echo-object-goal",
+        json={"name": "Echo object goal", "workflow": {**workflow, "id": "echo-object-goal"}},
+        headers=USER,
+    )
+    assert saved.status_code == 200, saved.text
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"workflow_id": "echo-object-goal", "goal": "nested goal", "wait_s": 10},
+        headers=USER,
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["outputs"] == {"text": "nested goal"}
+
+
+def test_saved_workflow_maps_chat_goal_to_descriptive_string_input(client: TestClient) -> None:
+    workflow = copy.deepcopy(WORKFLOW)
+    workflow["id"] = "python-code-workflow"
+    workflow["goal"] = "Generate Python code for a requested task."
+    workflow["allowed_tasks"] = ["text.echo"]
+    workflow["inputs"] = {
+        "language": {"type": "string"},
+        "source_text": {"type": "string", "description": "The task to implement."},
+        "format": {"type": "string"},
+    }
+    workflow["nodes"][0]["inputs"]["text"] = "$inputs.source_text"
+    saved = client.put(
+        "/api/v1/workflows/python-code-workflow",
+        json={"name": "Python code workflow", "workflow": workflow},
+        headers=USER,
+    )
+    assert saved.status_code == 200, saved.text
+
+    response = client.post(
+        "/api/v1/runs",
+        json={
+            "workflow_id": "python-code-workflow",
+            "goal": "give python code for sum of two numbers",
+            "inputs": {"language": "Python", "format": "code"},
+            "wait_s": 10,
+        },
+        headers=USER,
+    )
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "completed"
+    assert run["outputs"] == {"text": "give python code for sum of two numbers"}
+
+
+def test_orchestrator_goal_runs_code_workflow_without_unneeded_optional_inputs() -> None:
+    agent = create_agent_app(CODE_CARD, {"code.generate": _generate_code}, "http://code.test")
+    http = httpx.AsyncClient(transport=httpx.ASGITransport(app=agent))
+    settings = Settings(catalog_dir=None, allowed_hosts=("code.test",))
+    with TestClient(create_app(settings, http)) as client:
+        assert client.post("/api/v1/capabilities", json=CODE_CONTRACT, headers=ADMIN).status_code == 201
+        registered = client.post("/api/v1/implementations", json={"url": "http://code.test"}, headers=ADMIN)
+        assert registered.status_code == 201, registered.text
+        assert client.post(
+            f"/api/v1/implementations/{registered.json()['key']}/approve", json={}, headers=ADMIN
+        ).status_code == 200
+        workflow = {
+            "id": "generate-python-code-with-codex",
+            "version": "1.0.0",
+            "goal": "Generate Python code for a user request.",
+            "allowed_tasks": ["code.generate"],
+            "inputs": {
+                "task_description": {"type": "string", "description": "The coding task."},
+                "required_libraries": {"type": "array", "items": {"type": "string"}},
+                "expected_input": {"type": "string"},
+                "expected_output": {"type": "string"},
+                "constraints": {"type": "string"},
+            },
+            "nodes": [
+                {
+                    "id": "generate_code",
+                    "type": "capability",
+                    "capability": "code.generate",
+                    "inputs": {
+                        "task_description": "$inputs.task_description",
+                        "required_libraries": "$inputs.required_libraries",
+                        "expected_input": "$inputs.expected_input",
+                        "expected_output": "$inputs.expected_output",
+                        "constraints": "$inputs.constraints",
+                    },
+                }
+            ],
+            "outputs": {"result": "$nodes.generate_code.output.code_snippet"},
+        }
+        saved = client.put(
+            "/api/v1/workflows/generate-python-code-with-codex",
+            json={"name": workflow["id"], "workflow": workflow},
+            headers=USER,
+        )
+        assert saved.status_code == 200, saved.text
+
+        response = client.post(
+            "/api/v1/runs",
+            json={
+                "workflow_id": workflow["id"],
+                "goal": "Create Python code for sum of two numbers 2 and 3",
+                "wait_s": 10,
+            },
+            headers=USER,
+        )
+        assert response.status_code == 201, response.text
+        run = response.json()
+        assert run["status"] == "completed"
+        assert run["outputs"] == {"result": "def add(a, b):\n    return a + b"}
+        assert run["inputs"]["task_description"] == "Create Python code for sum of two numbers 2 and 3"
+        assert "expected_input" not in run["inputs"]
+        assert "expected_output" not in run["inputs"]
+        stored = client.get(f"/api/v1/workflows/{workflow['id']}", headers=USER).json()
+        assert "expected_input" in stored["workflow"]["inputs"]
+        assert "expected_output" in stored["workflow"]["inputs"]
 
 
 @pytest.mark.parametrize(

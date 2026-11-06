@@ -1,4 +1,5 @@
 .venv/
+venv/
 node_modules/
 *.tsbuildinfo
 __pycache__/
@@ -6,14 +7,34 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .hypothesis/
+.mypy_cache/
+.pyright/
+.tox/
 *.egg-info/
 dist/
 build/
+.coverage
+.coverage.*
+htmlcov/
+.vite/
+coverage/
+playwright-report/
+test-results/
+pip-wheel-metadata/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
 .env
 .env.*
 !.env.example
 /.ueoa-data/
 /AgentFramework/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
 
 # Personal / living material - not committed (anchored to the repo root).
 /docs/

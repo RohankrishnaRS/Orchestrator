@@ -7,6 +7,7 @@ import os
 import ssl
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
 import truststore
@@ -14,6 +15,8 @@ import truststore
 from ueoa.jsontext import extract_json_object
 
 _REQUIRED = ("UEOA_LLM_URL", "UEOA_LLM_MODEL", "UEOA_LLM_AGENT_ID", "UEOA_LLM_PROJECT_ID")
+_DEFAULT_AZURE_ENDPOINT = "https://secureapi-aoai-north-central-us.openai.azure.com"
+_DEFAULT_AZURE_DEPLOYMENT = "gpt-4o"
 
 
 class LLMError(RuntimeError):
@@ -142,6 +145,90 @@ class FoundationLLM:
             raise LLMUnavailableError("deadline") from exc
         if parsed is None:
             raise LLMError("model did not return a JSON object")
+        return parsed
+
+
+class AzureOpenAIJsonLLM:
+    """Direct Azure OpenAI chat-completions client using credentials from the process environment."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        deployment: str,
+        api_key: str,
+        *,
+        api_version: str = "2024-10-21",
+        http: httpx.AsyncClient,
+        deadline_s: float = 110,
+    ) -> None:
+        self._url = (
+            f"{endpoint.rstrip('/')}/openai/deployments/{quote(deployment, safe='')}"
+            f"/chat/completions?api-version={quote(api_version, safe='.')}"
+        )
+        self._api_key = api_key
+        self._http = http
+        self._deadline_s = deadline_s
+
+    @classmethod
+    def from_env(cls, http: httpx.AsyncClient) -> AzureOpenAIJsonLLM | None:
+        api_key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return None
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", _DEFAULT_AZURE_ENDPOINT).strip()
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", _DEFAULT_AZURE_DEPLOYMENT).strip()
+        if not endpoint or not deployment:
+            raise LLMError("Azure OpenAI endpoint and deployment must not be blank")
+        if not endpoint.startswith(("https://", "http://")):
+            raise LLMError("AZURE_OPENAI_ENDPOINT must be an HTTP(S) URL")
+        return cls(
+            endpoint,
+            deployment,
+            api_key,
+            api_version=os.environ.get("AZURE_API_VERSION", os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")),
+            http=http,
+        )
+
+    async def _complete(self, system: str, user: str) -> str:
+        try:
+            response = await self._http.post(
+                self._url,
+                headers={"api-key": self._api_key},
+                json={
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        except httpx.TimeoutException as exc:
+            raise LLMUnavailableError("Azure OpenAI request timed out") from exc
+        except httpx.TransportError as exc:
+            raise LLMUnavailableError(f"Azure OpenAI unreachable: {exc.__class__.__name__}") from exc
+        if response.status_code != 200:
+            raise _status_error("Azure OpenAI", response.status_code)
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError("unexpected Azure OpenAI response shape") from exc
+        if not isinstance(content, str):
+            raise LLMError("Azure OpenAI returned a non-text response")
+        return content
+
+    async def complete_json(self, system: str, user: str, *, chain_id: str | None = None) -> dict[str, Any]:
+        del chain_id
+        try:
+            async with asyncio.timeout(self._deadline_s):
+                reply = await self._complete(system, user)
+                parsed = extract_json_object(reply)
+                if parsed is None:
+                    parsed = extract_json_object(
+                        await self._complete(system, f"{user}\n\nReply with exactly one valid JSON object.")
+                    )
+        except TimeoutError as exc:
+            raise LLMUnavailableError("Azure OpenAI deadline") from exc
+        if parsed is None:
+            raise LLMError("Azure OpenAI did not return a JSON object")
         return parsed
 
 

@@ -42,11 +42,21 @@ class InputSpec(BaseModel):
     description: str | None = None
 
 
+class CanvasPosition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: float
+    y: float
+
+
 class WorkflowNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(pattern=NODE_ID_PATTERN)
     type: NodeType = NodeType.CAPABILITY
+    kind: Literal["agent", "skill", "mcp_tool"] | None = None
+    skill_id: str | None = Field(default=None, min_length=1, max_length=120)
+    canvas_position: CanvasPosition | None = None
     capability: str | None = Field(default=None, pattern=CAPABILITY_ID_PATTERN)
     depends_on: list[str] = Field(default_factory=list)
     inputs: dict[str, Any] = Field(default_factory=dict)
@@ -82,6 +92,7 @@ class WorkflowSpec(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9-]*$")
     version: str = Field(pattern=SEMVER_PATTERN)
     goal: str
+    allowed_tasks: list[str] | None = Field(default=None, min_length=1, max_length=50)
     inputs: dict[str, InputSpec] = Field(default_factory=dict)
     nodes: list[WorkflowNode] = Field(min_length=1, max_length=MAX_WORKFLOW_NODES)
     outputs: dict[str, str] = Field(default_factory=dict)
