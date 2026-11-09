@@ -18,11 +18,11 @@ if not url:
 config.set_main_option("sqlalchemy.url", url)
 
 
-def include_object(obj, name, type_, reflected, compare_to):  # noqa: ANN001, D103
+def include_object(obj, name, type_, reflected, compare_to):
     return getattr(obj, "schema", SCHEMA) in (SCHEMA, None)
 
 
-def do_run_migrations(connection) -> None:  # noqa: ANN001
+def do_run_migrations(connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

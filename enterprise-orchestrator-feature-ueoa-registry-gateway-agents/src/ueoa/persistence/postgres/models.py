@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -14,7 +14,7 @@ SCHEMA = "ueoa"
 
 
 class Base(DeclarativeBase):
-    __table_args__ = {"schema": SCHEMA}
+    __table_args__: ClassVar[dict[str, Any]] = {"schema": SCHEMA}
 
 
 class CapabilityRow(Base):
