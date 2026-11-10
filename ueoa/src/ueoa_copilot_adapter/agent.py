@@ -26,22 +26,39 @@ WELCOME = (
 )
 
 
-def build_adapter() -> tuple[CloudAdapter, object | None]:
-    """Authenticated adapter when the Entra app settings exist (Azure Bot), anonymous adapter for local Playground."""
-    if environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID"):
-        from microsoft_agents.activity import load_configuration_from_env
-        from microsoft_agents.authentication.msal import MsalConnectionManager
+CLIENT_ID_VAR = "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID"
+ANONYMOUS_DEFAULTS = {
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE": "ClientSecret",
+    CLIENT_ID_VAR: "",
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET": "",
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID": "",
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__ANONYMOUS_ALLOWED": "true",
+}
 
-        config = load_configuration_from_env(environ)
-        connections = MsalConnectionManager(**config)
+
+def build_adapter() -> tuple[CloudAdapter, object, object]:
+    """Connection manager from CONNECTIONS__* env settings (Entra app + Azure Bot in production).
+
+    Without a client id the SDK runs in anonymous development mode (local Agents Playground only):
+    we supply an empty SERVICE_CONNECTION with ANONYMOUS_ALLOWED=true so unauthenticated activities are accepted.
+    """
+    from microsoft_agents.activity import load_configuration_from_env
+    from microsoft_agents.authentication.msal import MsalConnectionManager
+
+    authenticated = bool(environ.get(CLIENT_ID_VAR))
+    if not authenticated:
+        for key, value in ANONYMOUS_DEFAULTS.items():
+            environ.setdefault(key, value)
+        logger.warning("adapter: ANONYMOUS mode - local development with Agents Playground only")
+    else:
         logger.info("adapter: authenticated mode (Entra app configured)")
-        return CloudAdapter(connection_manager=connections), connections.get_default_connection_configuration()
-    logger.warning("adapter: ANONYMOUS mode - local development with Agents Playground only")
-    return CloudAdapter(), None
+    config = load_configuration_from_env(environ)
+    connections = MsalConnectionManager(**config)
+    adapter = CloudAdapter(connection_manager=connections)
+    return adapter, connections.get_default_connection_configuration(), connections
 
-
-ADAPTER, AUTH_CONFIGURATION = build_adapter()
-AGENT_APP = AgentApplication[TurnState](storage=MemoryStorage(), adapter=ADAPTER)
+ADAPTER, AUTH_CONFIGURATION, CONNECTIONS = build_adapter()
+AGENT_APP = AgentApplication[TurnState](storage=MemoryStorage(), adapter=ADAPTER, connection_manager=CONNECTIONS)
 UEOA = UeoaClient()
 
 

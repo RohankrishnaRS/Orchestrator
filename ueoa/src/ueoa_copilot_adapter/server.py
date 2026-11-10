@@ -25,7 +25,7 @@ async def messages(request: Request) -> Response:
 async def health(_: Request) -> Response:
     payload = {
         "status": "ok",
-        "mode": "authenticated" if AUTH_CONFIGURATION is not None else "anonymous-dev",
+        "mode": "authenticated" if environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID") else "anonymous-dev",
         "ueoa_base_url": UEOA.settings.base_url,
     }
     return Response(text=json.dumps(payload), content_type="application/json")
