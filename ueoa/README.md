@@ -72,9 +72,9 @@ Skills remain in the existing document store and require `UEOA_DATA_DIR` to surv
 
 Use the **Orchestrate** page to plan and run goals against the capabilities and agents you register.
 In Orchestrator chat, select a saved workflow and describe the task in the composer. The chat goal is bound to the
-workflow's best matching declared text input (for example `prompt`, `task_description`, or `source_text`); provide
-other required values through **+ → Workflow inputs (JSON)**. The workflow must include an executable agent/tool step
-to produce an answer.
+workflow's best matching declared text input (for example `prompt`, `task_description`, or `source_text`). Set defaults
+in the workflow for any other values it needs; chat sends the goal directly without per-run JSON input. The workflow
+must include an executable agent/tool step to produce an answer.
 The **Create → Prompt Builder** page uses Azure OpenAI to refine task requirements; choose **Use prompt in workflow**
 to hand the result to the visual workflow generator. Generation only uses capabilities with approved implementations.
 If none are approved, register an agent implementation and approve it before generating executable workflow steps.

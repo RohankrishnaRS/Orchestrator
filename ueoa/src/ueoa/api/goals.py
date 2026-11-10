@@ -61,8 +61,24 @@ def _error_response(exc: GoalError, correlation_id: str) -> JSONResponse:
 
 
 def _markdown(outputs: Any) -> str:
-    """outputs.report_markdown when present, else a compact Markdown rendering of the outputs."""
+    """Prefer source code and explanations, then report_markdown or a compact output rendering."""
     if isinstance(outputs, dict):
+        code = next(
+            (
+                value
+                for key, value in outputs.items()
+                if re.search(r"(?:code|sourcecode)", key, re.IGNORECASE)
+                and isinstance(value, str)
+                and value.strip()
+            ),
+            None,
+        )
+        if isinstance(code, str):
+            result = f"```\n{code.strip()}\n```"
+            explanation = outputs.get("explanation")
+            if isinstance(explanation, str) and explanation.strip():
+                return f"{result}\n\n{explanation.strip()}\n"
+            return result
         for key, value in outputs.items():
             if key.endswith("_markdown") and isinstance(value, str) and value.strip():
                 return value

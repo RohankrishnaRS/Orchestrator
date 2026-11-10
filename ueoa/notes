@@ -1,1 +1,5 @@
 .\.venv\Scripts\python.exe -m uvicorn ueoa.api.app:create_app --factory --host 127.0.0.1 --port 8000 --env-file .env
+
+teams
+$env:Path = [Environment]::GetEnvironmentVariable("Path","User") + ";" + [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + (npm prefix -g)
+teamsapptester

@@ -318,9 +318,6 @@ td code, code { color: #5549c9; font-family: ui-monospace, SFMono-Regular, Conso
 .composer-controls { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: 5px; }
 .composer-controls select { max-width: 210px; height: 31px; padding: 0 24px 0 8px; border: 1px solid var(--line); border-radius: 7px; color: #596277; background: #fff; font-size: 9px; }
 .send-button { min-height: 31px; padding: 0 10px; }
-.additional-input-editor { display: flex; flex-direction: column; gap: 5px; margin: 7px 4px 3px; padding: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 9px; }
-.additional-input-editor textarea { width: 100%; resize: vertical; padding: 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: 9px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
-.additional-input-editor small { color: var(--muted); font-size: 8px; }
 .staged-files { margin: 0 0 8px; }
 .staged-file { max-width: 230px; padding: 5px; }
 .capability-staged { color: var(--accent); }

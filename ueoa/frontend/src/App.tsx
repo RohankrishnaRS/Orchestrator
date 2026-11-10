@@ -1094,7 +1094,6 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const [selectedCapabilities, setSelectedCapabilities] = useState<string[]>([]);
   const [chatText, setChatText] = useState("");
-  const [runInputText, setRunInputText] = useState("{}");
   const [mode, setMode] = useState("");
   const [sending, setSending] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1198,7 +1197,6 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
     setStaged([]);
     setSelectedCapabilities([]);
     setChatText("");
-    setRunInputText("{}");
     setComposerError("");
     requestByMessage.current.clear();
     onClearRun();
@@ -1275,21 +1273,7 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
       setComposerError("Wait for the current run to finish before starting another run.");
       return;
     }
-    let additionalInputs: JsonRecord = {};
-    if (!resend) {
-      try {
-        const parsed: unknown = JSON.parse(runInputText);
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-          throw new Error("Additional workflow inputs must be a JSON object.");
-        }
-        additionalInputs = parsed as JsonRecord;
-      } catch (error) {
-        setComposerError(error instanceof Error ? error.message : "Additional workflow inputs must be valid JSON.");
-        return;
-      }
-    }
     const runInputs = {
-      ...additionalInputs,
       ...(resend?.inputs ?? {}),
       ...(capabilities.length ? { capabilities } : {}),
       ...(documents.length ? { documents } : {}),
@@ -1314,7 +1298,6 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
     setSelectedCapabilities([]);
     if (!resend) {
       setChatText("");
-      setRunInputText("{}");
     }
     setComposerError("");
     setSending(true);
@@ -1427,12 +1410,6 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
                   </button>;
                 }) : <small className="capability-picker-empty">No capabilities are available.</small>}
               </div>
-              <label className="additional-input-editor">
-                <b>Workflow inputs (JSON)</b>
-                <textarea value={runInputText} onChange={(event) => setRunInputText(event.target.value)} rows={5}
-                  aria-label="Additional workflow inputs" placeholder='{"customer_id":"123"}' spellCheck={false} />
-                <small>Extra values your saved workflow expects.</small>
-              </label>
             </div>}
             <input ref={fileInputRef} type="file" className="visually-hidden" accept=".pdf,.txt,.md,.csv,.json" multiple
               aria-label="Choose attachments" onChange={(event) => {
@@ -1530,6 +1507,7 @@ function RunProgress({ run, onViewApprovals, onCancelRun, cancelling }: {
 
 function resultMarkdown(outputs: unknown): string | null {
   if (!isRecord(outputs)) return null;
+  if (hasCodeField(outputs)) return null;
   if (typeof outputs.report_markdown === "string") return outputs.report_markdown;
   function findMarkdown(value: unknown): string | null {
     if (Array.isArray(value)) {
@@ -1551,18 +1529,36 @@ function resultMarkdown(outputs: unknown): string | null {
 
 function resultText(outputs: unknown): string | null {
   if (!isRecord(outputs)) return null;
-  for (const key of ["code_snippet", "result", "answer", "text"]) {
-    if (typeof outputs[key] === "string") return outputs[key];
+  const code = codeOutput(outputs);
+  if (hasCodeField(outputs)) return code;
+  for (const key of ["result", "answer", "text"]) {
+    if (typeof outputs[key] === "string" && outputs[key].trim()) return outputs[key];
   }
-  const textValues = Object.values(outputs).filter((value): value is string => typeof value === "string");
+  const textValues = Object.values(outputs).filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
   return textValues.length === 1 ? textValues[0] : null;
+}
+
+function codeOutput(outputs: JsonRecord): string | null {
+  for (const [name, value] of Object.entries(outputs)) {
+    if (/(?:code|sourcecode)/i.test(name) && typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function hasCodeField(outputs: JsonRecord): boolean {
+  return Object.keys(outputs).some((name) => /(?:code|sourcecode)/i.test(name));
 }
 
 function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy: () => void; onViewAudit: () => void }) {
   const outputs = isRecord(run.outputs) ? run.outputs : {};
   const markdown = resultMarkdown(run.outputs);
   const text = resultText(run.outputs);
-  const codeSnippet = typeof outputs.code_snippet === "string" ? outputs.code_snippet : null;
+  const codeSnippet = codeOutput(outputs);
+  const missingCode = hasCodeField(outputs) && codeSnippet === null;
   const highlights = Array.isArray(outputs.highlights) ? outputs.highlights : [];
   const actions = Array.isArray(outputs.action_items) ? outputs.action_items : [];
   const completed = run.status === "completed";
@@ -1579,14 +1575,16 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
     : run.error || "The run failed.";
   return <div className="assistant-result">
     {completed && <div className="result-body">
-      {markdown ? <Markdown source={markdown} /> : codeSnippet !== null
-        ? <>
-          {typeof outputs.explanation === "string" && <section><h4>Explanation</h4><p>{outputs.explanation}</p></section>}
-          <section><h4>Python code</h4><pre className="markdown-code"><code>{codeSnippet}</code></pre></section>
-          {typeof outputs.example_usage === "string" && <section><h4>Example usage</h4><pre className="markdown-code"><code>{outputs.example_usage}</code></pre></section>}
-        </>
-        : text !== null ? <pre className="markdown-code"><code>{text}</code></pre>
-          : <pre className="json-output">{pretty(run.outputs)}</pre>}
+      {missingCode ? <div className="chat-error"><AlertCircle size={15} />
+        The workflow completed without returning source code. Check that the selected agent fills its code output field.
+      </div> : markdown ? <Markdown source={markdown} /> : codeSnippet !== null
+          ? <>
+            <section><h4>Python code</h4><pre className="markdown-code"><code>{codeSnippet}</code></pre></section>
+            {typeof outputs.explanation === "string" && <section><h4>Explanation</h4><p>{outputs.explanation}</p></section>}
+            {typeof outputs.example_usage === "string" && <section><h4>Example usage</h4><pre className="markdown-code"><code>{outputs.example_usage}</code></pre></section>}
+          </>
+          : text !== null ? <pre className="markdown-code"><code>{text}</code></pre>
+            : <pre className="json-output">{pretty(run.outputs)}</pre>}
       {highlights.length > 0 && <section><h4>Highlights</h4><ul>{highlights.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
       {actions.length > 0 && <section><h4>Action items</h4><ul>{actions.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
     </div>}

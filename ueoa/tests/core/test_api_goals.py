@@ -6,8 +6,23 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from ueoa.api.app import Settings, create_app
+from ueoa.api.goals import _markdown
 
 ADMIN = {"X-Demo-Role": "admin"}
+
+
+def test_goal_markdown_prefers_code_over_summary_markdown() -> None:
+    result = _markdown(
+        {
+            "report_markdown": "The provided Python code demonstrates a sum.",
+            "python_code": "def add(a, b):\n    return a + b",
+            "explanation": "Returns the sum of two numbers.",
+        }
+    )
+
+    assert result.startswith("```\ndef add(a, b):\n    return a + b\n```")
+    assert "Returns the sum of two numbers." in result
+    assert "The provided Python code demonstrates a sum." not in result
 
 
 def client() -> TestClient:

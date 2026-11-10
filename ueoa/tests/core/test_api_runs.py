@@ -10,7 +10,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from ueoa.api.app import Settings, create_app
+from ueoa.api.app import Settings, _infer_workflow_input, _workflow_goal_inputs, create_app
+from ueoa.contracts import InputSpec, WorkflowSpec
 from ueoa.registry.models import UEOA_EXTENSION_URI
 from ueoa_sdk.host import InvocationContext, create_agent_app
 
@@ -246,17 +247,17 @@ def test_saved_workflow_maps_chat_goal_into_object_input(client: TestClient) -> 
     assert response.json()["outputs"] == {"text": "nested goal"}
 
 
-def test_saved_workflow_maps_chat_goal_to_descriptive_string_input(client: TestClient) -> None:
+def test_saved_workflow_maps_chat_goal_to_code_requirements_without_extra_inputs(client: TestClient) -> None:
     workflow = copy.deepcopy(WORKFLOW)
     workflow["id"] = "python-code-workflow"
     workflow["goal"] = "Generate Python code for a requested task."
     workflow["allowed_tasks"] = ["text.echo"]
     workflow["inputs"] = {
         "language": {"type": "string"},
-        "source_text": {"type": "string", "description": "The task to implement."},
+        "code_requirements": {"type": "string", "description": "The coding task to implement."},
         "format": {"type": "string"},
     }
-    workflow["nodes"][0]["inputs"]["text"] = "$inputs.source_text"
+    workflow["nodes"][0]["inputs"]["text"] = "$inputs.code_requirements"
     saved = client.put(
         "/api/v1/workflows/python-code-workflow",
         json={"name": "Python code workflow", "workflow": workflow},
@@ -269,7 +270,6 @@ def test_saved_workflow_maps_chat_goal_to_descriptive_string_input(client: TestC
         json={
             "workflow_id": "python-code-workflow",
             "goal": "give python code for sum of two numbers",
-            "inputs": {"language": "Python", "format": "code"},
             "wait_s": 10,
         },
         headers=USER,
@@ -278,6 +278,24 @@ def test_saved_workflow_maps_chat_goal_to_descriptive_string_input(client: TestC
     run = response.json()
     assert run["status"] == "completed"
     assert run["outputs"] == {"text": "give python code for sum of two numbers"}
+    assert run["inputs"]["code_requirements"] == "give python code for sum of two numbers"
+
+
+def test_story_goal_maps_to_topic_without_manual_workflow_inputs() -> None:
+    workflow = copy.deepcopy(WORKFLOW)
+    workflow["inputs"] = {
+        "topic": {"type": "string"},
+        "style": {"type": "string"},
+    }
+    spec = WorkflowSpec.model_validate(workflow)
+
+    assert _workflow_goal_inputs(spec, "Write a story about a brave fox.", {}) == {
+        "topic": "Write a story about a brave fox."
+    }
+    task_type = InputSpec.model_validate(
+        {"type": "string", "enum": ["code_generation", "story_writing"]}
+    )
+    assert _infer_workflow_input("task_type", task_type, "Write a story about a brave fox.") == "story_writing"
 
 
 def test_orchestrator_goal_runs_code_workflow_without_unneeded_optional_inputs() -> None:
@@ -297,7 +315,8 @@ def test_orchestrator_goal_runs_code_workflow_without_unneeded_optional_inputs()
             "goal": "Generate Python code for a user request.",
             "allowed_tasks": ["code.generate"],
             "inputs": {
-                "task_description": {"type": "string", "description": "The coding task."},
+                "code_requirements": {"type": "string", "description": "The coding task."},
+                "task_type": {"type": "string", "enum": ["code_generation", "story_writing"]},
                 "required_libraries": {"type": "array", "items": {"type": "string"}},
                 "expected_input": {"type": "string"},
                 "expected_output": {"type": "string"},
@@ -308,13 +327,7 @@ def test_orchestrator_goal_runs_code_workflow_without_unneeded_optional_inputs()
                     "id": "generate_code",
                     "type": "capability",
                     "capability": "code.generate",
-                    "inputs": {
-                        "task_description": "$inputs.task_description",
-                        "required_libraries": "$inputs.required_libraries",
-                        "expected_input": "$inputs.expected_input",
-                        "expected_output": "$inputs.expected_output",
-                        "constraints": "$inputs.constraints",
-                    },
+                    "inputs": {"constraints": "$inputs.task_type"},
                 }
             ],
             "outputs": {"result": "$nodes.generate_code.output.code_snippet"},
@@ -339,12 +352,38 @@ def test_orchestrator_goal_runs_code_workflow_without_unneeded_optional_inputs()
         run = response.json()
         assert run["status"] == "completed"
         assert run["outputs"] == {"result": "def add(a, b):\n    return a + b"}
-        assert run["inputs"]["task_description"] == "Create Python code for sum of two numbers 2 and 3"
+        assert run["inputs"]["code_requirements"] == "Create Python code for sum of two numbers 2 and 3"
+        assert run["inputs"]["task_type"] == "code_generation"
         assert "expected_input" not in run["inputs"]
         assert "expected_output" not in run["inputs"]
         stored = client.get(f"/api/v1/workflows/{workflow['id']}", headers=USER).json()
+        assert stored["workflow"]["nodes"][0]["inputs"] == {"constraints": "$inputs.task_type"}
         assert "expected_input" in stored["workflow"]["inputs"]
         assert "expected_output" in stored["workflow"]["inputs"]
+
+        direct_workflow = {
+            **workflow,
+            "id": "code-without-workflow-inputs",
+            "inputs": {},
+            "nodes": [{**workflow["nodes"][0], "inputs": {}}],
+        }
+        saved = client.put(
+            f"/api/v1/workflows/{direct_workflow['id']}",
+            json={"name": direct_workflow["id"], "workflow": direct_workflow},
+            headers=USER,
+        )
+        assert saved.status_code == 200, saved.text
+        direct_run = client.post(
+            "/api/v1/runs",
+            json={
+                "workflow_id": direct_workflow["id"],
+                "goal": "Write Python code that sums two numbers.",
+                "wait_s": 10,
+            },
+            headers=USER,
+        )
+        assert direct_run.status_code == 201, direct_run.text
+        assert direct_run.json()["outputs"] == {"result": "def add(a, b):\n    return a + b"}
 
 
 @pytest.mark.parametrize(

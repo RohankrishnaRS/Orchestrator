@@ -313,7 +313,14 @@ _GOAL_INPUT_NAMES = (
     "user_request",
     "task",
     "task_description",
+    "code_requirements",
     "code_request",
+    "story_prompt",
+    "story_idea",
+    "story_requirements",
+    "topic",
+    "subject",
+    "brief",
     "instruction",
     "user_input",
     "input_text",
@@ -335,6 +342,10 @@ _GOAL_HINTS = frozenset(
         "request",
         "task",
         "instruction",
+        "story",
+        "subject",
+        "topic",
+        "brief",
         "input",
         "text",
         "message",
@@ -390,13 +401,7 @@ def _workflow_goal_inputs(spec: WorkflowSpec, goal: str, inputs: dict[str, Any])
         ):
             target = object_inputs[0] if object_inputs else None
     if target is None:
-        available = ", ".join(spec.inputs) or "(none)"
-        raise HTTPException(
-            422,
-            "Could not identify a text input for the chat goal in this workflow. "
-            f"Declared inputs: {available}. Rename the task field to a goal/prompt/request field "
-            "or provide an unambiguous text field in Workflow inputs (JSON).",
-        )
+        return inputs
 
     declaration: InputSpec = spec.inputs[target]
     if declaration.type != "object":
@@ -427,6 +432,79 @@ def _workflow_goal_inputs(spec: WorkflowSpec, goal: str, inputs: dict[str, Any])
     return {**inputs, target: {**existing, property_name: goal}}
 
 
+def _bind_goal_to_required_agent_inputs(
+    spec: WorkflowSpec, goal: str, capabilities: Mapping[str, CapabilityContract]
+) -> None:
+    """Bind the chat goal to a missing required text input on an agent/tool step."""
+    for node in spec.nodes:
+        if node.type is not NodeType.CAPABILITY or not node.capability:
+            continue
+        capability = capabilities.get(node.capability)
+        if capability is None:
+            continue
+        schema = capability.input_schema
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = schema.get("required", []) if isinstance(schema, dict) else []
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            continue
+        missing_text = {
+            name: properties[name]
+            for name in required
+            if name not in node.inputs
+            and name in properties
+            and _is_string_field(properties[name])
+        }
+        target = _select_goal_field(missing_text, set(missing_text))
+        if target is not None:
+            node.inputs[target] = goal
+
+
+def _goal_task_type(goal: str) -> str:
+    lowered = goal.lower()
+    if re.search(r"\b(code|coding|program|python|javascript|typescript|function|script)\b", lowered):
+        return "code_generation"
+    if re.search(r"\b(story|fiction|novel|tale|character)\b", lowered):
+        return "story_writing"
+    if re.search(r"\b(summar|summary|brief)\b", lowered):
+        return "summarization"
+    if re.search(r"\b(translat|translation)\b", lowered):
+        return "translation"
+    if re.search(r"\b(analy[sz]|analysis|review)\b", lowered):
+        return "analysis"
+    if re.search(r"\b(email|letter)\b", lowered):
+        return "writing"
+    return "general"
+
+
+def _infer_workflow_input(name: str, declaration: InputSpec, goal: str) -> Any:
+    if "default" in declaration.model_fields_set:
+        return declaration.default
+    category = _goal_task_type(goal)
+    extra = declaration.model_extra or {}
+    choices = extra.get("enum")
+    if isinstance(choices, list):
+        category_terms = {
+            "code_generation": {"code", "coding", "program", "programming", "python", "javascript", "script"},
+            "story_writing": {"story", "fiction", "novel", "tale", "creative", "writing"},
+            "summarization": {"summar", "summary", "brief"},
+            "translation": {"translat"},
+            "analysis": {"analy", "analysis", "review"},
+            "writing": {"write", "writing", "email", "letter"},
+            "general": {"general", "other", "default"},
+        }[category]
+        for choice in choices:
+            if isinstance(choice, str):
+                words = set(re.findall(r"[a-z0-9]+", choice.lower()))
+                if words & category_terms:
+                    return choice
+        if len(choices) == 1:
+            return choices[0]
+    normalized_name = name.lower().replace("-", "_")
+    if normalized_name in {"task_type", "task_kind", "operation_type"}:
+        return category
+    return None
+
+
 def _referenced_workflow_inputs(spec: WorkflowSpec) -> set[str]:
     found: set[str] = set()
     expressions = [expression.source for node in spec.nodes for expression in node_expressions(node)]
@@ -452,6 +530,17 @@ def _prepare_saved_workflow(
     """Bind the chat goal and omit unset optional tool arguments from this run only."""
     spec = spec.model_copy(deep=True)
     run_inputs = _workflow_goal_inputs(spec, goal, inputs)
+    _bind_goal_to_required_agent_inputs(spec, goal, capabilities)
+    referenced = _referenced_workflow_inputs(spec)
+    for name in referenced:
+        if name in run_inputs:
+            continue
+        declaration = spec.inputs.get(name)
+        if declaration is None:
+            continue
+        inferred = _infer_workflow_input(name, declaration, goal)
+        if inferred is not None:
+            run_inputs[name] = inferred
     missing = {
         name
         for name, declaration in spec.inputs.items()
@@ -486,7 +575,6 @@ def _prepare_saved_workflow(
     still_required = missing & _referenced_workflow_inputs(spec)
     if still_required:
         raise HTTPException(422, f"workflow inputs required for this task: {', '.join(sorted(still_required))}")
-    referenced = _referenced_workflow_inputs(spec)
     spec.inputs = {
         name: declaration
         for name, declaration in spec.inputs.items()

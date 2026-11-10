@@ -6,8 +6,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from ueoa.agents.declarative import AgentDefinition, build_handler
 from ueoa.api.app import Settings, create_app
-from ueoa.llm import AzureOpenAIJsonLLM
+from ueoa.llm import AzureOpenAIJsonLLM, LLMError
 from ueoa.registry.service import RegistryError
 
 ADMIN = {"X-Demo-Role": "admin"}
@@ -31,6 +32,18 @@ class ScriptedLLM:
         return self.reply
 
 
+class SequenceLLM:
+    def __init__(self, replies: list[dict[str, Any]]) -> None:
+        self.replies = iter(replies)
+        self.system = ""
+        self.users: list[str] = []
+
+    async def complete_json(self, system: str, user: str, *, chain_id: str | None = None) -> dict[str, Any]:
+        self.system = system
+        self.users.append(user)
+        return next(self.replies)
+
+
 def _generated_config() -> dict[str, Any]:
     return {
         "description": "Answers product questions from provided details.",
@@ -49,6 +62,57 @@ def _generated_config() -> dict[str, Any]:
             "additionalProperties": False,
         },
     }
+
+
+@pytest.mark.anyio
+async def test_instruction_agent_repairs_empty_code_output() -> None:
+    llm = SequenceLLM(
+        [
+            {"python_code": "", "explanation": "A function can add two numbers."},
+            {"python_code": "def add(a, b):\n    return a + b", "explanation": "Returns the sum."},
+        ]
+    )
+    definition = AgentDefinition(
+        id="agent-py-code",
+        name="Python Code",
+        description="Generates Python code.",
+        template="instruction",
+        capability={
+            "id": "agent.py_code",
+            "description": "Generate Python code for a task.",
+            "use_when": "A user requests Python source code.",
+        },
+        instructions="Write Python code for the requested task.",
+        input_schema={
+            "type": "object",
+            "properties": {"task_description": {"type": "string"}},
+            "required": ["task_description"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "python_code": {"type": "string"},
+                "explanation": {"type": "string"},
+            },
+            "required": ["python_code", "explanation"],
+        },
+    )
+
+    result = await build_handler(definition, llm)({"task_description": "Write code to add two numbers."})
+
+    assert result["python_code"] == "def add(a, b):\n    return a + b"
+    assert "task-specific source code" in llm.system
+    assert len(llm.users) == 2
+    assert "must contain source code" in llm.users[1]
+
+    failing_llm = SequenceLLM(
+        [
+            {"python_code": "", "explanation": "A function can add two numbers."},
+            {"python_code": "", "explanation": "A function can add two numbers."},
+        ]
+    )
+    with pytest.raises(LLMError, match="python_code: must contain source code"):
+        await build_handler(definition, failing_llm)({"task_description": "Write code to add two numbers."})
 
 
 def test_agent_description_generates_reviewable_definition_with_user_name() -> None:

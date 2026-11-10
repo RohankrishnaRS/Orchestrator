@@ -55,6 +55,7 @@ def test_console_bundle_is_served_locally(html: str) -> None:
             response = client.get(path)
             assert response.status_code == 200
             assert response.content
+            assert b"Workflow inputs (JSON)" not in response.content
 
 
 def test_console_uses_framework_escaping() -> None:
