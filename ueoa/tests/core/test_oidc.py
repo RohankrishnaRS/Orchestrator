@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from ueoa.gateway.oidc import OidcError, OidcSettings, OidcVerifier, bearer_token
 
-ISSUER = "[https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"](https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0")
+ISSUER = "https" + "://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
 AUDIENCE = "api://ueoa-api-poc"
 
 _KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
