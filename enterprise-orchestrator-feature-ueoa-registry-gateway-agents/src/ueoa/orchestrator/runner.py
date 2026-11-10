@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -25,6 +26,7 @@ from ueoa.gateway.service import (
     Principal,
 )
 from ueoa.gateway.service import payload_hash as hash_payload
+from ueoa.persistence.writebehind import schedule_write
 
 from .expressions import ExpressionError, evaluate_source, resolve_bindings
 from .scheduler import TERMINAL, NodeState, RunStatus, aggregate_item_states, eligible_nodes, must_skip, run_status
@@ -41,6 +43,7 @@ _SCHEMA_KEYWORDS = frozenset(
 )
 _ERROR_CODE_ALIASES = {"output schema": "bad_output"}
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_]\w*(?:\.\w+)*)\}")
+logger = logging.getLogger(__name__)
 
 
 def _input_schema(declared: InputSpec) -> dict[str, Any]:
@@ -220,6 +223,8 @@ class RunController:
         max_active_runs: int = 20,
         max_active_runs_per_principal: int = 5,
         max_total_invocations: int = 32,
+        persist_run: Callable[[Run], Coroutine[Any, Any, None]] | None = None,
+        persist_approval: Callable[[str, str, int | None, str, str], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self._gateway = gateway
         self._capabilities = capabilities
@@ -238,6 +243,83 @@ class RunController:
         self._limiters: dict[str, asyncio.Semaphore] = {}
         self._wake: dict[str, asyncio.Event] = {}
         self._waiting_since: dict[str, float] = {}
+        self._persist = persist_run
+        self._persist_approval = persist_approval
+
+    def restore(self, records: list[dict[str, Any]]) -> None:
+        for record in reversed(records):
+            try:
+                run = self._restore_run(record)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("stored run skipped: %s", exc)
+                continue
+            self._runs[run.id] = run
+            self._limiters[run.id] = asyncio.Semaphore(self._max_parallel)
+            self._wake[run.id] = asyncio.Event()
+
+    @staticmethod
+    def _restore_run(record: dict[str, Any]) -> Run:
+        spec = WorkflowSpec.model_validate(record["workflow"])
+        nodes: dict[str, NodeResult] = {}
+        for node in spec.nodes:
+            raw = record.get("nodes", {}).get(node.id, {})
+            items = [
+                ItemResult(
+                    index=int(item["index"]),
+                    input=item.get("input"),
+                    state=NodeState(item["state"]),
+                    output=item.get("output"),
+                    error=item.get("error"),
+                    invocation_id=item.get("invocation_id"),
+                    implementation=item.get("implementation"),
+                    attempts=int(item.get("attempts", 0)),
+                )
+                for item in raw.get("items", [])
+            ]
+            nodes[node.id] = NodeResult(
+                state=NodeState(raw.get("state", NodeState.PENDING)),
+                output=raw.get("output"),
+                items=items,
+                error=raw.get("error"),
+                invocation_id=raw.get("invocation_id"),
+                implementation=raw.get("implementation"),
+                attempts=int(raw.get("attempts", 0)),
+                started_at=raw.get("started_at"),
+                finished_at=raw.get("finished_at"),
+                timeout_s=raw.get("timeout_s", node.timeout_s),
+            )
+        approvals = {
+            _approval_key(str(item["node"]), item.get("item")): PendingApproval(
+                node=str(item["node"]),
+                item=item.get("item"),
+                capability=str(item["capability"]),
+                payload=item["payload"],
+                payload_hash=str(item["payload_hash"]),
+                idempotency_key=str(item["idempotency_key"]),
+                requested_at=str(item["requested_at"]),
+                requested_by=str(item["requested_by"]),
+            )
+            for item in record.get("approvals", [])
+        }
+        return Run(
+            id=str(record["id"]),
+            spec=spec,
+            inputs=record.get("inputs", {}),
+            principal=Principal(str(record["principal"]), str(record["role"])),
+            status=RunStatus(record["status"]),
+            nodes=nodes,
+            events=[],
+            outputs=record.get("outputs"),
+            error=record.get("error"),
+            created_at=str(record["created_at"]),
+            finished_at=record.get("finished_at"),
+            plan=record.get("plan"),
+            approvals=approvals,
+        )
+
+    def _schedule_persist(self, run: Run) -> None:
+        if self._persist is not None:
+            schedule_write(self._persist(copy.deepcopy(run)), f"run {run.id}")
 
     async def start(
         self, spec: WorkflowSpec, inputs: dict[str, Any], principal: Principal, *, plan: dict[str, Any] | None = None
@@ -285,6 +367,7 @@ class RunController:
         self._limiters[run.id] = asyncio.Semaphore(self._max_parallel)
         self._wake[run.id] = asyncio.Event()
         run.emit("run_started", detail=spec.goal)
+        self._schedule_persist(run)
         self._launch(run)
         return run
 
@@ -317,6 +400,9 @@ class RunController:
 
     async def close(self) -> None:
         for run in [run for run in self._runs.values() if run.finished_at is None]:
+            if self._persist is not None and run.status is RunStatus.WAITING:
+                self._schedule_persist(run)
+                continue
             await self._cancel(run, "controller closed")
 
     async def submit_input(self, run_id: str, node_id: str, value: dict[str, Any]) -> Run:
@@ -335,6 +421,7 @@ class RunController:
         result.state, result.output, result.finished_at = NodeState.SUCCEEDED, value, _now()
         run.emit("input_received", node_id)
         run.emit("node_succeeded", node_id)
+        self._schedule_persist(run)
         self._resume(run)
         return run
 
@@ -395,6 +482,12 @@ class RunController:
                 self._aggregate(node, result)
             self._settle(run, node)
             self._resume(run)
+        self._schedule_persist(run)
+        if self._persist_approval is not None:
+            schedule_write(
+                self._persist_approval(run_id, node_id, item, decision, principal.name),
+                f"approval decision {run_id}/{node_id}",
+            )
         return run
 
     # ------------------------------------------------------------ internals
@@ -434,6 +527,7 @@ class RunController:
             node.id, index, node.capability or "", payload, digest, key, _now(), run.principal.name
         )
         run.emit("approval_requested", node.id, item=index, detail=digest)
+        self._schedule_persist(run)
 
     def _aggregate(self, node: WorkflowNode, result: NodeResult) -> None:
         states = [item.state for item in result.items]
@@ -463,6 +557,7 @@ class RunController:
             parts = [f"{failed} of {len(result.items)} items failed"] if failed else []
             parts += [f"{rejected} of {len(result.items)} items rejected"] if rejected else []
             run.emit("node_succeeded", node.id, detail="; ".join(parts), **_ids(result))
+        self._schedule_persist(run)
 
     def _timeout(self, node: WorkflowNode) -> float | None:
         if node.type is not NodeType.CAPABILITY:
@@ -489,10 +584,17 @@ class RunController:
         return run
 
     def _mark_cancelled(self, run: Run, detail: str) -> None:
+        if self._persist_approval is not None:
+            for pending in run.approvals.values():
+                schedule_write(
+                    self._persist_approval(run.id, pending.node, pending.item, "cancelled", "system"),
+                    f"approval cancellation {run.id}/{pending.node}",
+                )
         self._cancel_open_nodes(run)
         run.status, run.error, run.finished_at = RunStatus.CANCELLED, detail, _now()
         self._waiting_since.pop(run.id, None)
         run.emit("run_cancelled", detail=detail)
+        self._schedule_persist(run)
 
     def _cancel_open_nodes(self, run: Run) -> None:
         now = _now()
@@ -544,6 +646,7 @@ class RunController:
             self._cancel_open_nodes(run)
             run.status, run.error, run.finished_at = RunStatus.FAILED, f"{type(exc).__name__}: {exc}", _now()
             run.emit("run_finished", detail=run.error)
+            self._schedule_persist(run)
             return
         self._finish(run)
 
@@ -568,20 +671,24 @@ class RunController:
         if node.type is NodeType.HUMAN_INPUT:
             result.state = NodeState.WAITING_INPUT
             run.emit("node_waiting_input", node.id, detail=node.prompt_key or "")
+            self._schedule_persist(run)
             return None
         result.state = NodeState.RUNNING
         run.emit("node_started", node.id, detail=node.capability or "")
+        self._schedule_persist(run)
         return asyncio.create_task(self._run_node(run, node))
 
     def _skip(self, run: Run, node_id: str, reason: str) -> None:
         result = run.nodes[node_id]
         result.state, result.finished_at = NodeState.SKIPPED, _now()
         run.emit("node_skipped", node_id, detail=reason)
+        self._schedule_persist(run)
 
     def _fail(self, run: Run, node_id: str, error: str) -> None:
         result = run.nodes[node_id]
         result.state, result.error, result.finished_at = NodeState.FAILED, error, _now()
         run.emit("node_failed", node_id, detail=error)
+        self._schedule_persist(run)
 
     def _context(self, run: Run, node: WorkflowNode | None = None) -> dict[str, Any]:
         nodes: dict[str, Any] = {}
@@ -738,6 +845,7 @@ class RunController:
         if run.status is RunStatus.WAITING:
             self._waiting_since[run.id] = time.monotonic()
         if run.status in UNFINISHED:
+            self._schedule_persist(run)
             return
         context = self._context(run)
         outputs: dict[str, Any] = {}
@@ -765,6 +873,7 @@ class RunController:
             run.error = f"{failed}: {run.nodes[failed].error}" if failed else "workflow blocked"
         run.finished_at = _now()
         run.emit("run_finished", detail=str(run.status) if run.error is None else f"{run.status}: {run.error}")
+        self._schedule_persist(run)
 
 
 def _input_problems(name: str, declared: InputSpec, value: Any) -> list[str]:

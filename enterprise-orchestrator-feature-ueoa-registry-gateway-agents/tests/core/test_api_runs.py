@@ -163,6 +163,7 @@ def test_health_reports_planner_and_catalog(client: TestClient) -> None:
         "implementations": 1,
         "approved": 1,
         "default_role": "user",
+        "store": {"backend": "memory", "ok": True},
     }
 
 

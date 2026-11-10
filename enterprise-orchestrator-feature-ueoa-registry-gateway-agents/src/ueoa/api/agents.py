@@ -30,6 +30,7 @@ from ueoa.agents.declarative import (
 )
 from ueoa.gateway.service import GatewayDeniedError, GatewayFailedError, Principal
 from ueoa.llm import LLMError
+from ueoa.persistence.writebehind import schedule_write
 from ueoa.registry.models import Implementation, ImplementationStatus
 from ueoa.registry.service import RegistryError
 from ueoa.store import StoreError
@@ -131,7 +132,9 @@ def _contract_conflict(svc: "Services", defn: AgentDefinition) -> str | None:
     contract = capability_contract(defn)
     existing = svc.registry.capabilities.get(defn.capability.id)
     if existing is None:
-        svc.registry.register_capability(contract)
+        capability = svc.registry.register_capability(contract)
+        if svc.stores is not None and svc.stores.capabilities is not None:
+            schedule_write(svc.stores.capabilities.upsert(capability), f"capability {capability.id}")
         return None
     if existing.input_schema != contract["input_schema"] or existing.output_schema != contract["output_schema"]:
         return f"capability '{defn.capability.id}' exists with a different contract"
@@ -153,8 +156,22 @@ async def _register(
                 await asyncio.sleep(RETRY_S)
                 continue
             return None, str(exc)
+    if (
+        (not defn.approve or not impl.conformant)
+        and svc.stores is not None
+        and svc.stores.implementations is not None
+    ):
+        schedule_write(svc.stores.implementations.upsert(impl), f"implementation {impl.key}")
     if defn.approve and impl.conformant:
+        original_status = impl.status
         impl = svc.registry.approve(impl.key)
+        if svc.stores is not None and svc.stores.implementations is not None:
+            try:
+                await svc.stores.implementations.upsert(impl)
+            except Exception as exc:
+                impl.status = original_status
+                logger.error("failed to persist implementation approval for %s (%s)", impl.key, type(exc).__name__)
+                raise HTTPException(503, "implementation approval could not be persisted") from exc
     return impl, None
 
 
@@ -355,7 +372,19 @@ def create_router(
         if impl is not None and impl.status is ImplementationStatus.APPROVED:
             for other in _impls(svc, settings, agent_id):
                 if other.key != impl.key and other.status is not ImplementationStatus.REVOKED:
+                    old_status = other.status
                     svc.registry.set_status(other.key, ImplementationStatus.DEPRECATED)
+                    if svc.stores is not None and svc.stores.implementations is not None:
+                        try:
+                            await svc.stores.implementations.upsert(other)
+                        except Exception as exc:
+                            other.status = old_status
+                            logger.error(
+                                "failed to persist deprecated implementation %s (%s)",
+                                other.key,
+                                type(exc).__name__,
+                            )
+                            raise HTTPException(503, "implementation status could not be persisted") from exc
         return {
             **_full_view(svc, settings, defn, base_url),
             "implementation": _impl_view(impl),
@@ -374,20 +403,28 @@ def create_router(
         doc = svc.store.get(KIND, agent_id) or {}
         doc["public_base_url"] = base_url
         svc.store.put(KIND, agent_id, doc)
-        _, error = await _register(svc, defn, base_url)
+        _registered_impl, error = await _register(svc, defn, base_url)
         if error:
             raise HTTPException(502, f"Agent registration failed: {error}")
         return {**_full_view(svc, settings, defn, base_url), "registration_error": None}
 
     @router.delete("/api/v1/agents/{agent_id}")
-    def delete(  # pyright: ignore[reportUnusedFunction]
+    async def delete(  # pyright: ignore[reportUnusedFunction]
         agent_id: str, request: Request, _: Annotated[Principal, Depends(admin)]
     ) -> dict[str, Any]:
         known(agent_id)
         svc = services()
         revoked = [impl.key for impl in _impls(svc, settings, agent_id, str(request.base_url))]
         for key in revoked:
-            svc.registry.set_status(key, ImplementationStatus.REVOKED)
+            old_status = svc.registry.get(key).status
+            impl = svc.registry.set_status(key, ImplementationStatus.REVOKED)
+            if svc.stores is not None and svc.stores.implementations is not None:
+                try:
+                    await svc.stores.implementations.upsert(impl)
+                except Exception as exc:
+                    impl.status = old_status
+                    logger.error("failed to persist revoked implementation %s (%s)", key, type(exc).__name__)
+                    raise HTTPException(503, "implementation status could not be persisted") from exc
         svc.store.delete(KIND, agent_id)
         return {"id": agent_id, "revoked": revoked}
 

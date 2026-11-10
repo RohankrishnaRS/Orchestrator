@@ -8,6 +8,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.exc import OperationalError
 
 
 def _load_dotenv() -> None:
@@ -29,15 +30,23 @@ def main(argv: list[str] | None = None) -> int:
     action = args[0] if args else "upgrade"
     revision = args[1] if len(args) > 1 else ("head" if action == "upgrade" else "-1")
     cfg = Config(str(Path(__file__).parent / "postgres" / "alembic.ini"))
-    if action == "upgrade":
-        command.upgrade(cfg, revision)
-    elif action == "downgrade":
-        command.downgrade(cfg, revision)
-    elif action == "current":
-        command.current(cfg, verbose=True)
-    else:
-        print("usage: python -m ueoa.persistence.migrate [upgrade|downgrade|current] [revision]")
-        return 2
+    try:
+        if action == "upgrade":
+            command.upgrade(cfg, revision)
+        elif action == "downgrade":
+            command.downgrade(cfg, revision)
+        elif action == "current":
+            command.current(cfg, verbose=True)
+        else:
+            print("usage: python -m ueoa.persistence.migrate [upgrade|downgrade|current] [revision]")
+            return 2
+    except (OperationalError, OSError):
+        print(
+            "Could not connect to PostgreSQL or apply the migration. Start the database and verify "
+            "UEOA_STORE_URL, network access, and credentials. Connection details are hidden.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

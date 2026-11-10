@@ -175,12 +175,16 @@ async def on_startup(services: Services, settings: Settings) -> None:
     for doc in store.list(KIND):
         if doc.get("builtin") and doc.get("id") not in builtins:
             store.delete(KIND, doc["id"])
+            if services.stores is not None and services.stores.workflows is not None:
+                await services.stores.workflows.delete(str(doc["id"]))
     for workflow_id, doc in builtins.items():
         try:
             current = store.get(KIND, workflow_id)
             if current is not None and not current.get("builtin"):
                 logger.warning("built-in workflow '%s' replaces a saved template with the same id", workflow_id)
             store.put(KIND, workflow_id, doc)
+            if services.stores is not None and services.stores.workflows is not None:
+                await services.stores.workflows.upsert(doc)
         except StoreError as exc:
             logger.warning("skipping built-in workflow '%s': %s", workflow_id, exc)
 
@@ -243,7 +247,7 @@ def create_router(
         return fresh(doc)
 
     @router.put("/api/v1/workflows/{workflow_id}")
-    def save_workflow(workflow_id: str, body: TemplateRequest, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def save_workflow(workflow_id: str, body: TemplateRequest, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         existing = editable(workflow_id, who)
         workflow = {**body.workflow}
         workflow.setdefault("id", workflow_id)
@@ -294,10 +298,21 @@ def create_router(
             services().store.put(KIND, workflow_id, doc)
         except StoreError as exc:
             raise HTTPException(422, str(exc)) from exc
+        stores = services().stores
+        if stores is not None and stores.workflows is not None:
+            try:
+                await stores.workflows.upsert(doc)
+            except Exception as exc:
+                if existing is None:
+                    services().store.delete(KIND, workflow_id)
+                else:
+                    services().store.put(KIND, workflow_id, existing)
+                logger.error("failed to persist workflow '%s' (%s)", workflow_id, type(exc).__name__)
+                raise HTTPException(503, "workflow could not be persisted") from exc
         return doc
 
     @router.post("/api/v1/workflows/{workflow_id}/publish")
-    def publish_workflow(
+    async def publish_workflow(
         workflow_id: str, body: PublishRequest, who: Caller
     ) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         doc = editable(workflow_id, who)
@@ -334,13 +349,24 @@ def create_router(
             services().store.put(VERSION_KIND, version_id, published)
         except StoreError as exc:
             raise HTTPException(422, str(exc)) from exc
+        stores = services().stores
+        if stores is not None and stores.workflows is not None:
+            try:
+                await stores.workflows.upsert(published, kind=VERSION_KIND)
+            except Exception as exc:
+                services().store.delete(VERSION_KIND, version_id)
+                logger.error("failed to persist published workflow '%s' (%s)", version_id, type(exc).__name__)
+                raise HTTPException(503, "published workflow could not be persisted") from exc
         return published
 
     @router.delete("/api/v1/workflows/{workflow_id}")
-    def delete_workflow(workflow_id: str, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def delete_workflow(workflow_id: str, who: Caller) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         if editable(workflow_id, who) is None:
             raise HTTPException(404, f"unknown workflow '{workflow_id}'")
         services().store.delete(KIND, workflow_id)
+        stores = services().stores
+        if stores is not None and stores.workflows is not None:
+            await stores.workflows.delete(workflow_id)
         return {"id": workflow_id, "deleted": True}
 
     @router.post("/api/v1/workflows/validate")

@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -92,6 +94,24 @@ def test_agent_generation_reports_missing_azure_configuration(monkeypatch: pytes
         )
     assert response.status_code == 503
     assert "Set AZURE_OPENAI_API_KEY and restart the server." in response.json()["detail"]
+
+
+def test_dotenv_loading_preserves_process_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ueoa.api.app import _load_environment
+
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "AZURE_OPENAI_API_KEY=dotenv-test-key\nAZURE_OPENAI_ENDPOINT=https://dotenv.example.test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://process.example.test")
+
+    _load_environment(env_file)
+
+    assert os.environ["AZURE_OPENAI_API_KEY"] == "dotenv-test-key"
+    assert os.environ["AZURE_OPENAI_ENDPOINT"] == "https://process.example.test"
 
 
 def test_hosted_agent_registration_uses_the_running_application_url(monkeypatch: pytest.MonkeyPatch) -> None:

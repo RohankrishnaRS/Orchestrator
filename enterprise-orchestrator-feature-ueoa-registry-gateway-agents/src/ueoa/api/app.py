@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal
 import httpx
 import truststore
 import yaml
+from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +44,8 @@ from ueoa.orchestrator.expressions import ExpressionError, parse, references
 from ueoa.orchestrator.graph import node_expressions
 from ueoa.orchestrator.planner import Planner
 from ueoa.orchestrator.runner import PendingApproval, Run, RunController, RunError
+from ueoa.persistence import Stores, build_stores
+from ueoa.persistence.writebehind import flush_writes, schedule_write
 from ueoa.registry.models import DEFAULT_ENTRA_SCOPE, Implementation, ImplementationStatus
 from ueoa.registry.seed import load_capabilities
 from ueoa.registry.service import Registry, RegistryError
@@ -55,6 +58,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 NODE_TIMEOUT_HEADROOM_S = 15
 
 logger = logging.getLogger(__name__)
+
+
+def _load_environment(env_file: Path | None = None) -> None:
+    load_dotenv(env_file or ROOT / ".env", override=False)
 
 
 def _env_list(name: str, default: str = "") -> tuple[str, ...]:
@@ -109,13 +116,27 @@ class Services:
     node_timeout: Callable[[str], float | None] | None = None
     runner_applies_node_timeout: bool = False
     store: JsonStore = field(default_factory=JsonStore)
+    stores: Stores | None = None
     # model used by agents the platform hosts itself (agent studio); None = hosting disabled
     agent_llm: JsonLLM | None = None
 
 
-async def build_services(settings: Settings, http: httpx.AsyncClient) -> Services:
+async def build_services(settings: Settings, http: httpx.AsyncClient, stores: Stores | None = None) -> Services:
     catalog = settings.catalog_dir
     capabilities = load_capabilities(catalog / "capabilities") if catalog else {}
+    catalog_capability_ids = set(capabilities)
+    if stores is not None and stores.capabilities is not None:
+        for capability in capabilities.values():
+            await stores.capabilities.upsert(capability)
+        stored_capabilities = await stores.capabilities.list()
+        for capability in stored_capabilities:
+            current = capabilities.get(capability.id)
+            if current is None or (
+                capability.id not in catalog_capability_ids
+                and tuple(map(int, capability.version.split(".")))
+                > tuple(map(int, current.version.split(".")))
+            ):
+                capabilities[capability.id] = capability
     token_provider = EntraTokenProvider()
     loopback_token_provider = None
     if settings.entra_static_token:
@@ -130,10 +151,14 @@ async def build_services(settings: Settings, http: httpx.AsyncClient) -> Service
         entra_scopes=settings.entra_scopes,
     )
     registry = Registry(capabilities, invoker, http, settings.allowed_hosts, entra_scopes=settings.entra_scopes)
+    if stores is not None and stores.implementations is not None:
+        registry.restore(await stores.implementations.list())
     if catalog:
         for path in sorted((catalog / "implementations").glob("*.yaml")):
             for raw in yaml.safe_load(path.read_text(encoding="utf-8")) or []:
-                await registry.register_seed(raw)
+                impl = await registry.register_seed(raw)
+                if stores is not None and stores.implementations is not None:
+                    await stores.implementations.upsert(impl, seed=True)
     entitlements_file = catalog / "entitlements.yaml" if catalog else None
     roles = (
         yaml.safe_load(entitlements_file.read_text(encoding="utf-8"))
@@ -141,7 +166,13 @@ async def build_services(settings: Settings, http: httpx.AsyncClient) -> Service
         else DEFAULT_ENTITLEMENTS
     )
     entitlements = Entitlements(roles)
-    gateway = Gateway(registry, invoker, entitlements, allow_self_approval=settings.allow_self_approval)
+    gateway = Gateway(
+        registry,
+        invoker,
+        entitlements,
+        allow_self_approval=settings.allow_self_approval,
+        audit_writer=stores.audit if stores is not None else None,
+    )
 
     def node_timeout(capability_id: str) -> float | None:
         try:
@@ -150,10 +181,21 @@ async def build_services(settings: Settings, http: httpx.AsyncClient) -> Service
             return None
 
     try:
-        runs = RunController(gateway, lambda: registry.capabilities, node_timeout=node_timeout)
+        runs = RunController(
+            gateway,
+            lambda: registry.capabilities,
+            node_timeout=node_timeout,
+            persist_run=stores.runs.persist if stores is not None and stores.runs is not None else None,
+            persist_approval=stores.approvals.decide if stores is not None and stores.approvals is not None else None,
+        )
         applies = True
     except TypeError:  # runner without the node_timeout hook: the API raises timeouts itself
-        runs = RunController(gateway, lambda: registry.capabilities)
+        runs = RunController(
+            gateway,
+            lambda: registry.capabilities,
+            persist_run=stores.runs.persist if stores is not None and stores.runs is not None else None,
+            persist_approval=stores.approvals.decide if stores is not None and stores.approvals is not None else None,
+        )
         applies = False
     return Services(
         registry,
@@ -164,6 +206,7 @@ async def build_services(settings: Settings, http: httpx.AsyncClient) -> Service
         node_timeout=node_timeout,
         runner_applies_node_timeout=applies,
         store=JsonStore(settings.data_dir),
+        stores=stores,
     )
 
 
@@ -602,11 +645,14 @@ def create_app(
     planner_llm: JsonLLM | None = None,
     agent_llm: JsonLLM | None = None,
 ) -> FastAPI:
-    settings = settings or Settings()
+    if settings is None:
+        _load_environment()
+        settings = Settings()
     agents_api = _optional_module("ueoa.api.agents")
     workflows_api = _optional_module("ueoa.api.workflows")
     skills_api = _optional_module("ueoa.api.skills")
     mcp_catalog_api = _optional_module("ueoa.api.mcp_catalog")
+    goals_api = _optional_module("ueoa.api.goals")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -614,21 +660,38 @@ def create_app(
         client = http or httpx.AsyncClient(
             verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), timeout=httpx.Timeout(600, connect=10)
         )
-        app.state.services = await build_services(settings, client)
-        app.state.services.planner = _build_planner(settings, planner_llm, client)
-        app.state.services.agent_llm = _build_agent_llm(agent_llm or planner_llm, client)
-        for module in (agents_api, workflows_api, skills_api, mcp_catalog_api):
-            startup = getattr(module, "on_startup", None)
-            if startup is not None:
-                await startup(app.state.services, settings)
+        stores = build_stores()
+        app.state.stores = stores
         try:
+            if stores.backend == "postgres" and not await stores.healthy():
+                raise RuntimeError(
+                    "UEOA_STORE_URL is set, but PostgreSQL is unreachable. Check the URL and start the database."
+                )
+            app.state.services = await build_services(settings, client, stores)
+            app.state.services.planner = _build_planner(settings, planner_llm, client)
+            app.state.services.agent_llm = _build_agent_llm(agent_llm or planner_llm, client)
+            if stores.workflows is not None:
+                for doc in await stores.workflows.list():
+                    restored = dict(doc)
+                    kind = str(restored.pop("_kind", "workflows"))
+                    app.state.services.store.put(kind, str(restored["id"]), restored)
+            if stores.runs is not None:
+                app.state.services.runs.restore(await stores.runs.list_recent(limit=200))
+            for module in (agents_api, workflows_api, skills_api, mcp_catalog_api, goals_api):
+                startup = getattr(module, "on_startup", None)
+                if startup is not None:
+                    await startup(app.state.services, settings)
             yield
         finally:
-            close_runs = getattr(app.state.services.runs, "close", None)
-            if close_runs is not None:
-                await close_runs()
-            if isinstance(app.state.services.token_provider, EntraTokenProvider):
-                await app.state.services.token_provider.close()
+            svc = getattr(app.state, "services", None)
+            if svc is not None:
+                close_runs = getattr(svc.runs, "close", None)
+                if close_runs is not None:
+                    await close_runs()
+                if isinstance(svc.token_provider, EntraTokenProvider):
+                    await svc.token_provider.close()
+            await flush_writes()
+            await stores.close()
             if http is None:
                 await client.aclose()
 
@@ -640,6 +703,9 @@ def create_app(
 
     def services() -> Services:
         return app.state.services  # type: ignore[no-any-return]
+
+    def persistence_stores() -> Stores:
+        return app.state.stores  # type: ignore[no-any-return]
 
     def principal(x_demo_role: Annotated[str | None, Header()] = None) -> Principal:
         role = (x_demo_role or settings.default_role).lower()
@@ -684,11 +750,15 @@ def create_app(
         ]
 
     @app.post("/api/v1/capabilities", status_code=201)
-    def register_capability(  # pyright: ignore[reportUnusedFunction]
+    async def register_capability(  # pyright: ignore[reportUnusedFunction]
         contract: Annotated[dict[str, Any], Body()], _: Annotated[Principal, Depends(admin)]
     ) -> dict[str, Any]:
         try:
-            return services().registry.register_capability(contract).model_dump(mode="json")
+            capability = services().registry.register_capability(contract)
+            stores = services().stores
+            if stores is not None and stores.capabilities is not None:
+                schedule_write(stores.capabilities.upsert(capability), f"capability {capability.id}")
+            return capability.model_dump(mode="json")
         except RegistryError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -712,7 +782,10 @@ def create_app(
         body: RegisterRequest, _: Annotated[Principal, Depends(admin)]
     ) -> dict[str, Any]:
         try:
-            return _impl_view(await services().registry.register_from_url(body.url, body.overlay))
+            impl = await services().registry.register_from_url(body.url, body.overlay)
+            if (stores := services().stores) is not None and stores.implementations is not None:
+                schedule_write(stores.implementations.upsert(impl), f"implementation {impl.key}")
+            return _impl_view(impl)
         except RegistryError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -721,16 +794,33 @@ def create_app(
         card: Annotated[dict[str, Any], Body()], _: Annotated[Principal, Depends(admin)]
     ) -> dict[str, Any]:
         try:
-            return _impl_view(await services().registry.register_card(card))
+            impl = await services().registry.register_card(card)
+            if (stores := services().stores) is not None and stores.implementations is not None:
+                schedule_write(stores.implementations.upsert(impl), f"implementation {impl.key}")
+            return _impl_view(impl)
         except RegistryError as exc:
             raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/implementations/{key}/approve")
-    def approve(  # pyright: ignore[reportUnusedFunction]
+    async def approve(  # pyright: ignore[reportUnusedFunction]
         key: str, body: ApproveRequest, _: Annotated[Principal, Depends(admin)]
     ) -> dict[str, Any]:
         try:
-            return _impl_view(services().registry.approve(key, body.priority))
+            previous = services().registry.get(key).model_copy(deep=True)
+        except RegistryError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        try:
+            impl = services().registry.approve(key, body.priority)
+            stores = services().stores
+            if stores is not None and stores.implementations is not None:
+                try:
+                    await stores.implementations.upsert(impl)
+                except Exception as exc:
+                    impl.status = previous.status
+                    impl.priority = previous.priority
+                    logger.error("failed to persist implementation approval for %s (%s)", key, type(exc).__name__)
+                    raise HTTPException(503, "implementation approval could not be persisted") from exc
+            return _impl_view(impl)
         except RegistryError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -746,7 +836,26 @@ def create_app(
             raise HTTPException(502, _record_view(exc.record)) from exc
 
     @app.get("/api/v1/audit")
-    def audit(who: Annotated[Principal, Depends(principal)]) -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+    async def audit(who: Annotated[Principal, Depends(principal)]) -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+        stores = services().stores
+        if stores is not None and stores.audit is not None:
+            records = await stores.audit.recent(limit=2000)
+            return [
+                {
+                    "invocation_id": record["invocation_id"],
+                    "at": record["at"],
+                    "principal": {"name": record["principal"], "role": record["role"]},
+                    "capability": record["capability"],
+                    "status": record["status"],
+                    "implementation": record["implementation"],
+                    "duration_ms": record["duration_ms"],
+                    "steps": record["checks"],
+                    "output": record["output"],
+                    "error": record["reason"],
+                }
+                for record in records
+                if who.role == "admin" or record["principal"] == who.name
+            ]
         return [
             _record_view(record)
             for record in reversed(services().gateway.audit)
@@ -754,7 +863,9 @@ def create_app(
         ]
 
     @app.get("/api/v1/health")
-    def health() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def health(
+        stores: Annotated[Stores, Depends(persistence_stores)],
+    ) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         svc = services()
         impls = svc.registry.implementations()
         return {
@@ -764,6 +875,7 @@ def create_app(
             "implementations": len(impls),
             "approved": sum(impl.status is ImplementationStatus.APPROVED for impl in impls),
             "default_role": settings.default_role,
+            "store": {"backend": stores.backend, "ok": await stores.healthy()},
         }
 
     @app.get("/api/v1/overview")
@@ -1022,7 +1134,7 @@ def create_app(
 
     app.include_router(create_mcp_router(services, principal, allowed_origins=settings.allowed_origins))
     # feature routers: create_router(services, principal, admin, settings) -> APIRouter
-    for module in (agents_api, workflows_api, skills_api, mcp_catalog_api):
+    for module in (agents_api, workflows_api, skills_api, mcp_catalog_api, goals_api):
         if module is not None:
             app.include_router(module.create_router(services, principal, admin, settings))
 

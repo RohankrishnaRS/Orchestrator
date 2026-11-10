@@ -30,7 +30,8 @@ Open **http://127.0.0.1:8766** (API docs at `/docs`). The key prompt does not ec
 this PowerShell window; environment variables are scoped to that process. AI agent generation and workflow planning use
 Azure OpenAI only. Hosted agents use the application address that receives their registration request, so agents work
 when the server runs on a non-default local port. Set `UEOA_PUBLIC_BASE_URL` when the app is behind a proxy or must be
-reachable at a different address. The app reads environment variables directly and does not automatically load `.env`.
+reachable at a different address. The app loads `.env` from the repository root; variables already set in the process
+environment take precedence.
 Set `UEOA_DATA_DIR` before starting the API to persist hosted-agent definitions, workflow templates, and Skills catalog
 entries between restarts:
 
@@ -47,6 +48,27 @@ npm ci
 npm run build
 cd ..
 ```
+
+## Persistence (PostgreSQL)
+
+Set `UEOA_STORE_URL` to enable PostgreSQL; an empty URL keeps the current in-memory backend. The local database
+helper requires Docker Desktop to be installed and running. On PowerShell systems that block script execution, invoke
+the helper with `-ExecutionPolicy Bypass` for this process only:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\pg-start.ps1
+$env:UEOA_STORE_URL = "postgresql+asyncpg://ueoa:ueoa-dev-only@localhost:5432/ueoa"
+.\.venv\Scripts\python.exe -m pip install -e ".[db]"
+.\.venv\Scripts\python.exe -m ueoa.persistence.migrate upgrade
+.\.venv\Scripts\python.exe -m uvicorn ueoa.api.app:create_app --factory --host 127.0.0.1 --port 8766
+```
+
+PostgreSQL stores capability contracts, implementation cards and operator status/priority, workflow templates and
+versions, runs and node results, pending/decided approvals, and gateway audit history. Catalog capabilities and
+seed implementations are upserted at startup; approved, deprecated, and revoked implementation decisions are kept
+instead of being overwritten by catalog seeds. Implementations, workflows, pending approvals, and recent runs are
+reloaded on restart. Cards persist only secret-reference names, never secret values. Hosted-agent definitions and
+Skills remain in the existing document store and require `UEOA_DATA_DIR` to survive restarts.
 
 Use the **Orchestrate** page to plan and run goals against the capabilities and agents you register.
 In Orchestrator chat, select a saved workflow and describe the task in the composer. The chat goal is bound to the
@@ -84,6 +106,7 @@ tools declared by registered agent cards can be invoked by the gateway over Stre
 - Requests are limited to trusted `Host` headers, local origins (or `UEOA_ALLOWED_ORIGINS`) and a body size limit.
   Outbound calls only go to `UEOA_ALLOWED_HOSTS`. Secrets are referenced by name (`UEOA_SECRET_*`), never stored in cards.
 - `UEOA_ENTRA_STATIC_TOKEN` is a development-only fixed token and is sent to loopback hosts only.
-- Registry capabilities/implementations, runs, approvals, and the audit are in memory and are lost on restart.
+- With the default memory backend, registry capabilities/implementations, runs, approvals, and audit history are lost
+  on restart. Set `UEOA_STORE_URL` to retain them in PostgreSQL.
 - Hosted-agent definitions, workflow templates, and Skills entries use the JSON document store only when
   `UEOA_DATA_DIR` is configured; without it, those objects are also in memory.

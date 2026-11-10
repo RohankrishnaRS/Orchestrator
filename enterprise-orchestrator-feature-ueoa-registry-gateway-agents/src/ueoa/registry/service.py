@@ -82,6 +82,9 @@ class Registry:
     def implementations(self) -> list[Implementation]:
         return sorted(self._implementations.values(), key=lambda impl: impl.key)
 
+    def restore(self, implementations: Iterable[Implementation]) -> None:
+        self._implementations.update({impl.key: impl for impl in implementations})
+
     def get(self, key: str) -> Implementation:
         try:
             return self._implementations[key]
@@ -108,6 +111,13 @@ class Registry:
     async def register_seed(self, raw_card: dict[str, Any]) -> Implementation:
         """Code-reviewed seed cards (in-process tools) still run conformance, then are approved."""
         card = _parse_card(raw_card)
+        existing = self._implementations.get(card.key)
+        if existing is not None and existing.status in {
+            ImplementationStatus.APPROVED,
+            ImplementationStatus.DEPRECATED,
+            ImplementationStatus.REVOKED,
+        }:
+            return existing
         impl = Implementation(card=card, source="seed", card_sha256=_sha256(raw_card))
         impl.checks = await self._conformance(card)
         if not impl.conformant:

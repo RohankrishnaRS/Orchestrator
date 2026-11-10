@@ -3,7 +3,7 @@ import type { FormEvent } from "react";
 import {
   Activity, AlertCircle, ArrowRight, Bot, Check, ChevronRight, CircleHelp,
   Clock3, Copy, Database, FileText, GitBranch, LayoutDashboard, LoaderCircle,
-  Menu, Play, Plus, RefreshCw, Send, Server, ShieldCheck, Sparkles, Terminal, X, Trash2,
+  Menu, Play, Plus, RefreshCw, Send, Server, ShieldCheck, Sparkles, Square, Terminal, X, Trash2,
 } from "lucide-react";
 import WorkflowStudio, { type RunResult, type Workflow, type WorkflowDocument, type WorkflowSummary, type Validation } from "./WorkflowStudio";
 
@@ -114,7 +114,7 @@ type ChatMessage = {
   attachments?: ChatAttachment[];
   selectedCapabilities?: string[];
   workflowId?: string;
-  stage?: "planning" | "running" | "completed" | "failed";
+  stage?: "planning" | "running" | "completed" | "failed" | "cancelled";
   statusText?: string;
   plan?: JsonRecord;
   run?: RunDetail;
@@ -280,6 +280,7 @@ function App() {
   const [notice, setNotice] = useState<{ text: string; tone: "good" | "bad" } | null>(null);
   const [inputsText, setInputsText] = useState("{}");
   const [selectedRun, setSelectedRun] = useState<RunDetail | null>(null);
+  const [cancellingRunId, setCancellingRunId] = useState<string | null>(null);
   const [draftGoal, setDraftGoal] = useState("");
   const [draft, setDraft] = useState<JsonRecord | null>(null);
   const [workflowName, setWorkflowName] = useState("");
@@ -430,6 +431,20 @@ function App() {
       setSelectedRun(await api<RunDetail>(`/api/v1/runs/${encodeURIComponent(id)}`, role));
     } catch (error) {
       announce(error instanceof Error ? error.message : String(error), "bad");
+    }
+  }
+
+  async function cancelRun(id: string) {
+    setCancellingRunId(id);
+    try {
+      const run = await api<RunDetail>(`/api/v1/runs/${encodeURIComponent(id)}/cancel`, role, { method: "POST" });
+      setSelectedRun(run);
+      announce(`Run ${id} stopped.`);
+      await refresh();
+    } catch (error) {
+      announce(error instanceof Error ? error.message : String(error), "bad");
+    } finally {
+      setCancellingRunId(null);
     }
   }
 
@@ -774,6 +789,7 @@ function App() {
             <Orchestrator
               data={data} role={role} selectedRun={selectedRun}
               onSelectedRun={setSelectedRun} onClearRun={() => setSelectedRun(null)}
+              onCancelRun={cancelRun} cancellingRunId={cancellingRunId}
               onViewAudit={viewAudit} onViewApprovals={() => navigate("Approvals")}
             />
           )}
@@ -830,7 +846,8 @@ function App() {
             <MCP servers={data.mcpServers} role={role} busy={busy} onRegister={registerMcpServer} onDelete={removeMcpServer} />
           )}
           {!loading && page === "Runs" && (
-            <Runs data={data} selectedRun={selectedRun} onSelect={loadRun} />
+            <Runs data={data} selectedRun={selectedRun} onSelect={loadRun}
+              onCancelRun={cancelRun} cancellingRunId={cancellingRunId} />
           )}
           {!loading && page === "Approvals" && (
             <Approvals data={data} onDecide={decideApproval} />
@@ -1066,9 +1083,10 @@ function Markdown({ source }: { source: string }) {
   return <div className="markdown-content">{blocks}</div>;
 }
 
-function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onViewAudit, onViewApprovals }: {
+function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCancelRun, cancellingRunId, onViewAudit, onViewApprovals }: {
   data: Data; role: string; selectedRun: RunDetail | null;
   onSelectedRun: (run: RunDetail) => void; onClearRun: () => void;
+  onCancelRun: (id: string) => void; cancellingRunId: string | null;
   onViewAudit: () => void; onViewApprovals: () => void;
 }) {
   const loaded = useMemo(loadChatMessages, []);
@@ -1087,6 +1105,24 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
   const fileInputRef = useRef<HTMLInputElement>(null);
   const requestByMessage = useRef<Map<string, ChatRequest>>(new Map());
   const restoreAttempted = useRef<Set<string>>(new Set());
+  const workflowChoices = useMemo(() => {
+    const latestPublished = new Map<string, WorkflowSummary>();
+    for (const workflow of data.workflows) {
+      if (!workflow.published) continue;
+      const family = workflow.version_ref?.split("@", 1)[0] || workflow.id;
+      const current = latestPublished.get(family);
+      if (!current || (workflow.version || "").localeCompare(current.version || "", undefined, { numeric: true }) > 0) {
+        latestPublished.set(family, workflow);
+      }
+    }
+    const latestIds = new Set([...latestPublished.values()].map((workflow) => workflow.id));
+    return data.workflows
+      .filter((workflow) => !workflow.published || latestIds.has(workflow.id))
+      .sort((left, right) =>
+        Number(left.builtin) - Number(right.builtin) ||
+        Number(left.published) - Number(right.published) ||
+        (left.name || left.id).localeCompare(right.name || right.id));
+  }, [data.workflows]);
 
   useEffect(() => {
     try {
@@ -1110,14 +1146,16 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
         if (message.role !== "assistant" || message.run?.id !== selectedRun.id) return message;
         changed = true;
         const completed = selectedRun.status === "completed";
-        const failed = CHAT_TERMINAL_FAILURES.has(selectedRun.status);
-        const stage: ChatMessage["stage"] = completed ? "completed" : failed ? "failed" : "running";
+        const cancelled = selectedRun.status === "cancelled";
+        const failed = CHAT_TERMINAL_FAILURES.has(selectedRun.status) && !cancelled;
+        const stage: ChatMessage["stage"] = completed ? "completed" : cancelled ? "cancelled" : failed ? "failed" : "running";
         return {
           ...message,
           run: selectedRun,
           stage,
-          statusText: completed ? "Completed" : failed ? "Run failed" : selectedRun.status === "waiting" ? "Waiting for input or approval" : "Running...",
-          error: failed ? selectedRun.error || Object.values(selectedRun.nodes).find((node) => node.error)?.error || "The run failed." : message.error,
+          statusText: completed ? "Completed" : cancelled ? "Stopped" : failed ? "Run failed" : selectedRun.status === "waiting" ? "Waiting for input or approval" : "Running...",
+          error: failed ? selectedRun.error || Object.values(selectedRun.nodes).find((node) => node.error)?.error || "The run failed." :
+            cancelled ? undefined : message.error,
         };
       });
       return changed ? next : current;
@@ -1146,10 +1184,10 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
   }, [menuOpen]);
   useEffect(() => {
     const currentWorkflow = mode.startsWith("workflow:") ? mode.slice("workflow:".length) : "";
-    if (!data.workflows.some((workflow) => workflow.id === currentWorkflow)) {
-      setMode(data.workflows[0] ? `workflow:${data.workflows[0].id}` : "");
+    if (!workflowChoices.some((workflow) => workflow.id === currentWorkflow)) {
+      setMode(workflowChoices[0] ? `workflow:${workflowChoices[0].id}` : "");
     }
-  }, [data.workflows, mode]);
+  }, [mode, workflowChoices]);
 
   function updateMessage(id: string, update: (message: ChatMessage) => ChatMessage) {
     setMessages((current) => current.map((message) => message.id === id ? update(message) : message));
@@ -1289,9 +1327,11 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
       onSelectedRun(run);
       updateMessage(assistantId, (message) => ({
         ...message, run, stage: run.status === "completed" ? "completed" :
-          CHAT_TERMINAL_FAILURES.has(run.status) ? "failed" : "running",
+          run.status === "cancelled" ? "cancelled" :
+            CHAT_TERMINAL_FAILURES.has(run.status) ? "failed" : "running",
         statusText: run.status === "completed" ? "Completed" :
-          CHAT_TERMINAL_FAILURES.has(run.status) ? "Run failed" : "Running...",
+          run.status === "cancelled" ? "Stopped" :
+            CHAT_TERMINAL_FAILURES.has(run.status) ? "Run failed" : "Running...",
         ...(workflowId ? { plan: { workflow: run.workflow, rationale: run.plan?.rationale || `Running saved workflow for: ${text}` } } : {}),
       }));
     } catch (error) {
@@ -1342,7 +1382,8 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
               <span className="chat-attachment" key={`${file.name}-${index}`}><FileText size={13} /> {file.name}
                 <small>{(file.size / 1024).toFixed(0)} KB · {file.mediaType}</small></span>)}</div>}
             {message.role === "assistant" && message.plan && <PlanSummary plan={message.plan} />}
-            {message.role === "assistant" && message.run && <RunProgress run={message.run} onViewApprovals={onViewApprovals} />}
+            {message.role === "assistant" && message.run && <RunProgress run={message.run} onViewApprovals={onViewApprovals}
+              onCancelRun={onCancelRun} cancelling={cancellingRunId === message.run.id} />}
             {message.role === "assistant" && message.stage === "failed" && message.error && <div className="chat-error"><AlertCircle size={15} />{message.error}</div>}
             {message.role === "assistant" && message.fallbackWorkflows && message.fallbackWorkflows.length > 0 &&
               <div className="workflow-fallback"><p>Try a saved workflow instead:</p>{message.fallbackWorkflows.map((id) =>
@@ -1411,8 +1452,10 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onVi
               }} />
             <div className="composer-controls">
               <select aria-label="Saved workflow" value={mode} onChange={(event) => setMode(event.target.value)}>
-                {!data.workflows.length && <option value="">No saved workflows</option>}
-                {data.workflows.map((workflow) => <option value={`workflow:${workflow.id}`} key={workflow.id}>{workflow.name || workflow.id}</option>)}
+                {!workflowChoices.length && <option value="">No saved workflows</option>}
+                {workflowChoices.map((workflow) => <option value={`workflow:${workflow.id}`} key={workflow.id}>
+                  {workflow.name || workflow.id}{workflow.published ? ` · v${workflow.version || "published"}` : ""}
+                </option>)}
               </select>
               <button type="button" className="primary-button send-button" disabled={sending || !mode || !chatText.trim()}
                 onClick={() => void sendMessage()}>
@@ -1448,7 +1491,9 @@ function PlanSummary({ plan }: { plan: JsonRecord }) {
   </div>;
 }
 
-function RunProgress({ run, onViewApprovals }: { run: RunDetail; onViewApprovals: () => void }) {
+function RunProgress({ run, onViewApprovals, onCancelRun, cancelling }: {
+  run: RunDetail; onViewApprovals: () => void; onCancelRun: (id: string) => void; cancelling: boolean;
+}) {
   const nodes = run.workflow.nodes.map((node) => {
     const result = run.nodes[node.id];
     const elapsed = result?.duration_ms ?? (result?.started_at
@@ -1469,8 +1514,13 @@ function RunProgress({ run, onViewApprovals }: { run: RunDetail; onViewApprovals
     </article>;
   });
   const waiting = run.status === "waiting" || run.status === "waiting_input" || run.status === "waiting_approval";
+  const active = ["pending", "running", "waiting"].includes(run.status);
   return <div className="run-progress">
-    <div className="run-progress-heading"><b>Run progress</b><Status value={run.status} /></div>
+    <div className="run-progress-heading"><b>Run progress</b><div className="run-progress-actions">
+      <Status value={run.status} />
+      {active && <button className="danger-button compact" onClick={() => onCancelRun(run.id)} disabled={cancelling}
+        aria-label={`Stop run ${run.id}`}><Square size={13} /> {cancelling ? "Stopping…" : "Stop run"}</button>}
+    </div></div>
     {nodes}
     {waiting && <div className="waiting-action"><span>Run is waiting for input or approval.</span>
     <button className="text-button" onClick={onViewApprovals}>View approvals <ArrowRight size={13} /></button>
@@ -1512,6 +1562,7 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
   const outputs = isRecord(run.outputs) ? run.outputs : {};
   const markdown = resultMarkdown(run.outputs);
   const text = resultText(run.outputs);
+  const codeSnippet = typeof outputs.code_snippet === "string" ? outputs.code_snippet : null;
   const highlights = Array.isArray(outputs.highlights) ? outputs.highlights : [];
   const actions = Array.isArray(outputs.action_items) ? outputs.action_items : [];
   const completed = run.status === "completed";
@@ -1528,9 +1579,14 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
     : run.error || "The run failed.";
   return <div className="assistant-result">
     {completed && <div className="result-body">
-      {markdown ? <Markdown source={markdown} /> : text !== null
-        ? <pre className="markdown-code"><code>{text}</code></pre>
-        : <pre className="json-output">{pretty(run.outputs)}</pre>}
+      {markdown ? <Markdown source={markdown} /> : codeSnippet !== null
+        ? <>
+          {typeof outputs.explanation === "string" && <section><h4>Explanation</h4><p>{outputs.explanation}</p></section>}
+          <section><h4>Python code</h4><pre className="markdown-code"><code>{codeSnippet}</code></pre></section>
+          {typeof outputs.example_usage === "string" && <section><h4>Example usage</h4><pre className="markdown-code"><code>{outputs.example_usage}</code></pre></section>}
+        </>
+        : text !== null ? <pre className="markdown-code"><code>{text}</code></pre>
+          : <pre className="json-output">{pretty(run.outputs)}</pre>}
       {highlights.length > 0 && <section><h4>Highlights</h4><ul>{highlights.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
       {actions.length > 0 && <section><h4>Action items</h4><ul>{actions.map((item, index) => <li key={index}>{String(item)}</li>)}</ul></section>}
     </div>}
@@ -2127,6 +2183,7 @@ function SavedWorkflows({ workflows, onEdit, onDelete, onCreate }: {
   onCreate: () => void;
 }) {
   const saved = workflows.filter((workflow) => !workflow.builtin && !workflow.published);
+  const published = workflows.filter((workflow) => workflow.published);
   return (
     <section className="panel saved-workflows">
       <div className="panel-heading">
@@ -2152,6 +2209,13 @@ function SavedWorkflows({ workflows, onEdit, onDelete, onCreate }: {
             </div>
           </article>
         ))}</div>}
+      {published.length > 0 && <div className="published-workflow-info">
+        <b>Published versions ({published.length})</b>
+        <span>Published snapshots are immutable and remain runnable after their editable draft is deleted.</span>
+        <ul>{published.map((workflow) => <li key={workflow.id}>
+          {workflow.name || workflow.id} · {workflow.version_ref || `v${workflow.version || "published"}`}
+        </li>)}</ul>
+      </div>}
     </section>
   );
 }
@@ -2193,14 +2257,22 @@ function Workflows({ data, inputsText, setInputsText, draftGoal, setDraftGoal, d
   );
 }
 
-function Runs({ data, selectedRun, onSelect }: { data: Data; selectedRun: RunDetail | null; onSelect: (id: string) => void }) {
+function Runs({ data, selectedRun, onSelect, onCancelRun, cancellingRunId }: {
+  data: Data; selectedRun: RunDetail | null; onSelect: (id: string) => void;
+  onCancelRun: (id: string) => void; cancellingRunId: string | null;
+}) {
+  const active = selectedRun && ["pending", "running", "waiting"].includes(selectedRun.status);
   return (
     <div className="two-column runs-layout">
       <section className="panel"><div className="panel-heading"><div><h2>Run history</h2><p>Runs visible to your selected role</p></div><span className="subtle-count">{data.runs.length} total</span></div>
         <RunList runs={data.runs} onSelect={onSelect} selectedId={selectedRun?.id} />
       </section>
       <section className="panel run-detail"><div className="panel-heading"><div><h2>Run details</h2><p>{selectedRun ? selectedRun.id : "Select a run to inspect its live state"}</p></div>
-        {selectedRun && <Status value={selectedRun.status} />}</div>
+        {selectedRun && <div className="run-progress-actions"><Status value={selectedRun.status} />
+          {active && <button className="danger-button compact" onClick={() => onCancelRun(selectedRun.id)}
+            disabled={cancellingRunId === selectedRun.id} aria-label={`Stop run ${selectedRun.id}`}>
+            <Square size={13} /> {cancellingRunId === selectedRun.id ? "Stopping…" : "Stop run"}
+          </button>}</div>}</div>
         {selectedRun ? <><div className="run-goal">{selectedRun.goal}</div>
           <div className="timeline">{selectedRun.workflow.nodes.map((node) => {
             const result = selectedRun.nodes[node.id];

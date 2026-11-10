@@ -10,16 +10,21 @@ import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 import jsonschema
 
 from ueoa.contracts import Effect
+from ueoa.persistence.writebehind import schedule_write
 from ueoa.registry.service import Registry, RegistryError
 
 from .invokers import InvocationError, Invoker
 
 MAX_REPLAYS = 1000
+
+
+class AuditWriter(Protocol):
+    async def append(self, entry: dict[str, Any]) -> None: ...
 
 
 def payload_hash(payload: Any) -> str:
@@ -97,11 +102,13 @@ class Gateway:
         *,
         max_audit: int = 2000,
         allow_self_approval: bool = False,
+        audit_writer: AuditWriter | None = None,
     ) -> None:
         self._registry = registry
         self._invoker = invoker
         self._entitlements = entitlements
         self._allow_self_approval = allow_self_approval
+        self._audit_writer = audit_writer
         self._replays: OrderedDict[tuple[str, str], tuple[str | None, dict[str, Any]]] = OrderedDict()
         self.audit: deque[InvocationRecord] = deque(maxlen=max_audit)
 
@@ -141,6 +148,28 @@ class Gateway:
         finally:
             record.duration_ms = int((time.perf_counter() - started) * 1000)
             self.audit.append(record)
+            if self._audit_writer is not None:
+                schedule_write(
+                    self._audit_writer.append(
+                        {
+                            "invocation_id": record.invocation_id,
+                            "at": record.at,
+                            "principal": record.principal.name,
+                            "role": record.principal.role,
+                            "capability": record.capability,
+                            "implementation": record.implementation,
+                            "status": record.status,
+                            "reason": record.error,
+                            "duration_ms": record.duration_ms,
+                            "checks": [
+                                {"name": step.name, "outcome": step.outcome, "detail": step.detail}
+                                for step in record.steps
+                            ],
+                            "output": record.output,
+                        }
+                    ),
+                    f"audit {record.invocation_id}",
+                )
 
     async def _run(
         self,

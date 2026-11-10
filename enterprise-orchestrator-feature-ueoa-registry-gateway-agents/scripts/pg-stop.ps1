@@ -1,0 +1,1 @@
+& "$env:USERPROFILE\pg16\pgsql\bin\pg_ctl.exe" -D "$env:USERPROFILE\pg16\data" stop
