@@ -69,7 +69,8 @@ def extract(text: str, clause_types: list[str]) -> list[dict[str, Any]]:
     sections = split_sections(text)
     results: list[dict[str, Any]] = []
     for clause_type in clause_types:
-        words = CLAUSE_KEYWORDS.get(clause_type) or tuple(p for p in clause_type.split("_") if len(p) > 3) or (clause_type,)
+        fallback = tuple(p for p in clause_type.split("_") if len(p) > 3) or (clause_type,)
+        words = CLAUSE_KEYWORDS.get(clause_type) or fallback
         best, best_score = None, 0
         for section in sections:
             heading, body = section["heading"].lower(), section["text"].lower()

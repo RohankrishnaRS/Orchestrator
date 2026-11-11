@@ -92,7 +92,7 @@ def agent_argparser(default_port: int, description: str) -> argparse.ArgumentPar
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=default_port)
-    parser.add_argument("--run", metavar="INPUT", help="run once on a JSON file (or '-' for stdin) and print the result")
+    parser.add_argument("--run", metavar="INPUT", help="run once on a JSON file (or - for stdin) and print the result")
     return parser
 
 

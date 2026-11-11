@@ -89,7 +89,7 @@ def test_bearer_token_header_when_configured() -> None:
         seen.update(request.headers)
         return httpx.Response(200, json=goal_payload("completed", True))
 
-    settings = UeoaClientSettings(base_url=BASE, bearer_token="tok", retries=0)
+    settings = UeoaClientSettings(base_url=BASE, bearer_token="tok", retries=0)  # noqa: S106 - test value
     client = UeoaClient(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     asyncio.run(client.run_goal("x"))
     assert seen["authorization"] == "Bearer tok" and "x-demo-role" not in seen
