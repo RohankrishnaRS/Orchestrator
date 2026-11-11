@@ -1,0 +1,24 @@
+MUTUAL NON-DISCLOSURE AGREEMENT
+
+This Mutual Non-Disclosure Agreement is entered into between Initech Corporation and Globex Industries.
+
+1. Purpose
+The parties wish to explore a business relationship and may disclose Confidential Information to each other.
+
+2. Definition of Confidential Information
+"Confidential Information" means any non-public business, technical or financial information disclosed by one party to the other, whether orally or in writing.
+
+3. Obligations of Confidentiality
+The Recipient shall keep the Discloser's Confidential Information strictly confidential, use it solely for the Purpose and protect it with at least the degree of care it uses for its own confidential information, and in no event less than reasonable care. The Recipient may disclose Confidential Information only to its employees and professional advisers who need to know it for the Purpose.
+
+4. Exclusions
+Confidential Information does not include information that is or becomes publicly available through no fault of the Recipient.
+
+5. Return of Materials
+Upon request, the Recipient shall return or destroy all Confidential Information.
+
+6. Governing Law
+This Agreement is governed by the laws of the State of New York.
+
+7. Term and Survival
+This Agreement commences on the Effective Date and continues for two years unless terminated earlier by either party on thirty days written notice. The obligations of confidentiality shall survive for five (5) years after the expiry or termination of this Agreement.

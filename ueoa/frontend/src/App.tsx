@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import RegisterCapability from "./RegisterCapability";
 import {
   Activity, AlertCircle, ArrowRight, Bot, Check, ChevronRight, CircleHelp,
   Clock3, Copy, Database, FileText, GitBranch, LayoutDashboard, LoaderCircle,
@@ -824,7 +825,7 @@ function App() {
             />
           )}
           {!loading && page === "Agent Registry" && (
-            <Registry
+            <Registry onCapabilityRegistered={refresh}
               data={data} role={role} registerUrl={registerUrl} setRegisterUrl={setRegisterUrl}
               onRegister={registerImplementation} onApprove={approveImplementation} busy={busy}
               onPreviewAgent={previewAgent} onSaveAgent={saveAgent} onDeleteAgent={removeAgent} onGetAgent={getAgent}
@@ -1596,9 +1597,10 @@ function AssistantResult({ run, onCopy, onViewAudit }: { run: RunDetail; onCopy:
   </div>;
 }
 
-function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onApprove, busy,
+function Registry({ onCapabilityRegistered, data, role, registerUrl, setRegisterUrl, onRegister, onApprove, busy,
   onPreviewAgent, onSaveAgent, onDeleteAgent, onGetAgent, onGenerateAgent, onRetryAgentRegistration,
 }: {
+  onCapabilityRegistered: () => Promise<void>;
   data: Data; role: string; registerUrl: string; setRegisterUrl: (value: string) => void;
   onRegister: (event: FormEvent<HTMLFormElement>) => void; onApprove: (key: string) => void; busy: boolean;
   onPreviewAgent: (definition: JsonRecord) => Promise<JsonRecord>;
@@ -1828,6 +1830,7 @@ function Registry({ data, role, registerUrl, setRegisterUrl, onRegister, onAppro
           {role === "admin" && item.status === "draft" && <button className="secondary-button compact" onClick={() => onApprove(item.key)}><Check size={14} /> Approve</button>}
         </article>)}</div> : <EmptyState text="No registry implementations match this filter." />}
       </section>
+      <RegisterCapability role={role} onRegistered={onCapabilityRegistered} />
       <section className="panel"><div className="panel-heading"><div><h2>Register an agent</h2><p>Use a published A2A card or create a model-backed hosted agent.</p></div></div>
         <div className="tab-row" role="tablist" aria-label="Agent registration method">
           <button type="button" className={`tab-button ${registrationMode === "describe" ? "selected" : ""}`} onClick={() => setRegistrationMode("describe")}><Sparkles size={14} /> Describe with AI</button>
