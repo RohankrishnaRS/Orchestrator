@@ -97,7 +97,8 @@ async def handle(payload: dict[str, Any], ctx: InvocationContext) -> dict[str, A
     if not isinstance(requested, list) or not all(isinstance(t, str) and t for t in requested):
         raise ValueError("'clause_types' must be a non-empty list of strings")
     clause_types = [normalise_type(t) for t in requested]
-    document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    raw_document = payload.get("document")
+    document: dict[str, Any] = raw_document if isinstance(raw_document, dict) else {}
     document_id = str(document.get("document_id") or document.get("sample") or payload.get("document_id") or "document")
     clauses = extract(text, clause_types)
     found = [c["clause_type"] for c in clauses if c["found"]]
