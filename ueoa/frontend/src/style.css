@@ -538,3 +538,49 @@ td code, code { color: #5549c9; font-family: ui-monospace, SFMono-Regular, Conso
   .studio-publish-bar > div:last-child { width: 100%; flex-wrap: wrap; }
   .studio-publish-bar > div:last-child button { flex: 1; }
 }
+
+.capability-search { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.capability-search input { width: 100%; min-width: 0; height: 36px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: #fff; font-size: 11px; }
+.capability-search > span:last-child { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.capability-catalog { display: grid; grid-template-columns: minmax(220px, .75fr) minmax(0, 1.5fr); gap: 16px; align-items: start; }
+.capability-list { display: flex; flex-direction: column; max-height: 690px; overflow-y: auto; border-top: 1px solid #f0f1f5; }
+.capability-list-item { width: 100%; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 12px 9px; border: 0; border-bottom: 1px solid #f0f1f5; color: inherit; background: transparent; text-align: left; }
+.capability-list-item:hover, .capability-list-item.active { background: #f8f7ff; }
+.capability-list-item.active { box-shadow: inset 3px 0 var(--accent); }
+.capability-list-main { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.capability-list-main b { color: var(--ink); font-size: 10px; overflow-wrap: anywhere; }
+.capability-list-main small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.capability-list-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.capability-list-meta > small { color: var(--muted); font-size: 9px; }
+.capability-detail { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
+.capability-detail-heading { margin-bottom: 13px; }
+.capability-detail-heading h2 { overflow-wrap: anywhere; }
+.capability-detail-heading .eyebrow { margin: 0 0 5px; font-size: 8px; }
+.capability-detail-heading p:last-child { margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.capability-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.capability-facts > div { min-width: 0; padding: 10px; border: 1px solid #f0f1f5; border-radius: 7px; background: #fbfbfd; }
+.capability-facts span, .capability-examples > span, .capability-guidance span { display: block; color: var(--muted); font-size: 9px; }
+.capability-facts b { display: block; margin-top: 5px; color: #414a5d; font-size: 10px; overflow-wrap: anywhere; }
+.capability-implementations, .capability-selection { margin-top: 16px; }
+.capability-implementations h3, .capability-selection h3 { margin: 0 0 8px; font-size: 11px; }
+.capability-implementations .muted { margin: 0; }
+.tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-list code { padding: 5px 7px; border: 1px solid #e8e6ff; border-radius: 5px; background: #fbfaff; overflow-wrap: anywhere; }
+.capability-guidance { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.capability-guidance > div { padding: 10px; border: 1px solid #f0f1f5; border-radius: 7px; background: #fbfbfd; }
+.capability-guidance p { margin: 5px 0 0; color: #596277; font-size: 10px; line-height: 1.55; white-space: pre-wrap; }
+.capability-examples { margin-top: 10px; }
+.capability-examples ul { margin: 5px 0 0; padding-left: 17px; color: #596277; font-size: 10px; line-height: 1.6; }
+.capability-json-grid { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+.capability-json-grid details { min-width: 0; padding: 10px; border: 1px solid #f0f1f5; border-radius: 7px; }
+.capability-json-grid summary { color: var(--accent); cursor: pointer; font-size: 10px; font-weight: 700; }
+.capability-json-grid .json-output { max-height: 260px; margin-top: 8px; }
+
+@media (max-width: 850px) {
+  .capability-catalog { grid-template-columns: minmax(0, 1fr); }
+  .capability-list { max-height: 280px; }
+}
+@media (max-width: 520px) {
+  .capability-facts, .capability-guidance { grid-template-columns: minmax(0, 1fr); }
+  .capability-detail { padding: 12px; }
+}

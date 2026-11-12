@@ -19,8 +19,18 @@ type Health = {
 };
 type Capability = {
   id: string;
+  version: string;
   description: string;
   effects: string;
+  languages: string[];
+  selection_doc: {
+    use_when: string;
+    do_not_use_when: string;
+    examples: Record<string, string[]>;
+  } | null;
+  input_schema: JsonRecord;
+  output_schema: JsonRecord;
+  samples: JsonRecord[];
   implementations: string[];
 };
 type Implementation = {
@@ -170,7 +180,7 @@ type Data = {
   mcpServers: McpServer[];
   overview: OverviewStats | null;
 };
-type Page = "Overview" | "Prompt Builder" | "Orchestrator" | "Agent Registry" | "Workflow" | "Saved workflows" | "Workflows" | "Skills" | "MCP Registry" | "Runs" | "Approvals" | "Audit";
+type Page = "Overview" | "Prompt Builder" | "Orchestrator" | "Agent Registry" | "Capabilities" | "Workflow" | "Saved workflows" | "Workflows" | "Skills" | "MCP Registry" | "Runs" | "Approvals" | "Audit";
 
 const EMPTY: Data = {
   health: null,
@@ -192,6 +202,7 @@ const NAV: { label: Page; group: string; icon: typeof LayoutDashboard }[] = [
   { label: "Saved workflows", group: "Create", icon: FileText },
   { label: "Orchestrator", group: "Run", icon: Terminal },
   { label: "Agent Registry", group: "Build", icon: Bot },
+  { label: "Capabilities", group: "Build", icon: FileText },
   { label: "Skills", group: "Build", icon: CircleHelp },
   { label: "MCP Registry", group: "Build", icon: Server },
   { label: "Runs", group: "Run", icon: Activity },
@@ -832,6 +843,9 @@ function App() {
               onGenerateAgent={generateAgentConfiguration} onRetryAgentRegistration={retryAgentRegistration}
             />
           )}
+          {!loading && page === "Capabilities" && (
+            <CapabilityCatalog capabilities={data.capabilities} onRegister={() => navigate("Agent Registry")} />
+          )}
           {!loading && page === "Workflows" && (
             <Workflows
               data={data} inputsText={inputsText} setInputsText={setInputsText}
@@ -911,6 +925,100 @@ function Overview({ data, onNavigate, onSelectRun }: {
           <tbody>{data.capabilities.slice(0, 8).map((cap) => <tr key={cap.id}><td><b>{cap.id}</b><small className="cell-detail">{cap.description}</small></td>
             <td><Status value={cap.effects} /></td><td>{cap.implementations.length ? cap.implementations.join(", ") : <span className="muted">None</span>}</td></tr>)}</tbody></table></div>
           : <EmptyState text="No capabilities are registered yet." /> }
+      </section>
+    </div>
+  );
+}
+
+function CapabilityCatalog({ capabilities, onRegister }: {
+  capabilities: Capability[];
+  onRegister: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const filtered = capabilities.filter((capability) =>
+    `${capability.id} ${capability.description} ${capability.effects}`.toLowerCase().includes(query.toLowerCase()));
+  const selected = filtered.find((capability) => capability.id === selectedId) ?? filtered[0];
+
+  return (
+    <div className="stack">
+      <section className="panel">
+        <div className="panel-heading">
+          <div><h2>Registered capabilities</h2><p>Browse capability contracts and inspect the schemas and examples used by their implementations.</p></div>
+          <button type="button" className="primary-button" onClick={onRegister}><Plus size={14} /> Register capability</button>
+        </div>
+        <label className="capability-search">
+          <span className="visually-hidden">Search capabilities</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by ID, description, or effect" />
+          <span>{filtered.length} of {capabilities.length}</span>
+        </label>
+        {!filtered.length ? <EmptyState text={capabilities.length ? "No capabilities match your search." : "No capabilities are registered yet."} /> : (
+          <div className="capability-catalog">
+            <div className="capability-list" aria-label="Registered capabilities">
+              {filtered.map((capability) => (
+                <button type="button" key={capability.id}
+                  className={`capability-list-item ${selected?.id === capability.id ? "active" : ""}`}
+                  onClick={() => setSelectedId(capability.id)}>
+                  <span className="capability-list-main">
+                    <b>{capability.id}</b>
+                    <small>{capability.description}</small>
+                  </span>
+                  <span className="capability-list-meta">
+                    <Status value={capability.effects} />
+                    <small>v{capability.version}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+            {selected && (
+              <article className="capability-detail">
+                <div className="panel-heading capability-detail-heading">
+                  <div><p className="eyebrow">CAPABILITY CONTRACT</p><h2>{selected.id}</h2><p>{selected.description}</p></div>
+                  <Status value={selected.effects} />
+                </div>
+                <div className="capability-facts">
+                  <div><span>Version</span><b>{selected.version}</b></div>
+                  <div><span>Languages</span><b>{selected.languages.length ? selected.languages.join(", ") : "Not specified"}</b></div>
+                  <div><span>Implementations</span><b>{selected.implementations.length}</b></div>
+                </div>
+                <div className="capability-implementations">
+                  <h3>Implementations</h3>
+                  {selected.implementations.length
+                    ? <div className="tag-list">{selected.implementations.map((implementation) => <code key={implementation}>{implementation}</code>)}</div>
+                    : <p className="muted">No implementations are registered for this capability.</p>}
+                </div>
+                {selected.selection_doc && (
+                  <div className="capability-selection">
+                    <h3>Selection guidance</h3>
+                    <div className="capability-guidance">
+                      <div><span>Use when</span><p>{selected.selection_doc.use_when}</p></div>
+                      {selected.selection_doc.do_not_use_when && <div><span>Do not use when</span><p>{selected.selection_doc.do_not_use_when}</p></div>}
+                    </div>
+                    {Object.entries(selected.selection_doc.examples).map(([language, examples]) => (
+                      examples.length > 0 && <div className="capability-examples" key={language}>
+                        <span>Examples ({language})</span><ul>{examples.map((example) => <li key={example}>{example}</li>)}</ul>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="capability-json-grid">
+                  <details open>
+                    <summary>Input schema</summary>
+                    <pre className="json-output">{pretty(selected.input_schema)}</pre>
+                  </details>
+                  <details>
+                    <summary>Output schema</summary>
+                    <pre className="json-output">{pretty(selected.output_schema)}</pre>
+                  </details>
+                  <details>
+                    <summary>Conformance samples ({selected.samples.length})</summary>
+                    <pre className="json-output">{pretty(selected.samples)}</pre>
+                  </details>
+                </div>
+              </article>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );

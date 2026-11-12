@@ -17,18 +17,15 @@ pausing for human input and approvals.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-$key = Read-Host "Azure OpenAI API key" -AsSecureString
-$env:AZURE_OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $key).Password
-$env:AZURE_OPENAI_ENDPOINT = "https://secureapi-aoai-north-central-us.openai.azure.com"
-$env:AZURE_OPENAI_DEPLOYMENT = "gpt-4o"
-$env:AZURE_API_VERSION = "2024-10-21"
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m uvicorn ueoa.api.app:create_app --factory --host 127.0.0.1 --port 8766
 ```
 
-Open **http://127.0.0.1:8766** (API docs at `/docs`). The key prompt does not echo the key. Keep the server running in
-this PowerShell window; environment variables are scoped to that process. AI agent generation and workflow planning use
-Azure OpenAI only. Hosted agents use the application address that receives their registration request, so agents work
+Open **http://127.0.0.1:8766** (API docs at `/docs`). Keep the server running in this PowerShell window. Azure OpenAI
+configuration is optional: without it, the console and API run normally, but AI workflow planning and agent generation
+are unavailable. To enable them, set `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, and
+`AZURE_API_VERSION` before starting the server. Hosted agents use the application address that receives their
+registration request, so agents work
 when the server runs on a non-default local port. Set `UEOA_PUBLIC_BASE_URL` when the app is behind a proxy or must be
 reachable at a different address. The app loads `.env` from the repository root; variables already set in the process
 environment take precedence.
