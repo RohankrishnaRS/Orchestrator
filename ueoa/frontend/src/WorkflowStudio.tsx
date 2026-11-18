@@ -6,7 +6,13 @@ import {
   Sparkles, Trash2, Wrench, ZoomIn, ZoomOut,
 } from "lucide-react";
 
-type Capability = { id: string; description: string; implementations: string[] };
+type Capability = {
+  id: string;
+  description: string;
+  implementations: string[];
+  input_schema: Record<string, unknown>;
+  samples: Record<string, unknown>[];
+};
 type Agent = { id: string; name: string; version: string; capability: string };
 type Skill = { id: string; name: string; description: string; instructions: string };
 type McpServer = { id: string; name: string; description: string };
@@ -20,6 +26,7 @@ type Step = {
   skill_id?: string;
   depends_on: string[];
   inputs: Record<string, unknown>;
+  timeout_s: number;
   canvas_position: { x: number; y: number };
 };
 export type Workflow = {
@@ -41,6 +48,7 @@ export type WorkflowDocument = {
 export type RunResult = {
   id: string;
   status: string;
+  error?: string | null;
   nodes: Record<string, { state: string; error?: string; output?: unknown }>;
   outputs: unknown;
 };
@@ -57,6 +65,7 @@ type Props = {
   onLoad: (id: string) => Promise<WorkflowDocument>;
   onValidate: (workflow: Workflow) => Promise<Validation>;
   onSave: (id: string, workflow: Workflow, name: string, description: string) => Promise<WorkflowDocument>;
+  onPublish: (id: string) => Promise<void>;
   onDraft: (goal: string) => Promise<{
     ok: boolean;
     workflow: Workflow | null;
@@ -69,6 +78,7 @@ type Props = {
 
 const START_INPUT = { id: "input", label: "Input", x: 45, y: 275 };
 const END_OUTPUT = { id: "output", label: "Output", x: 1120, y: 275 };
+const DEFAULT_NODE_TIMEOUT_S = 120;
 
 function slug(value: string): string {
   return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "new-workflow";
@@ -77,6 +87,80 @@ function slug(value: string): string {
 function stepId(value: string): string {
   const cleaned = value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
   return cleaned && /^[a-z]/.test(cleaned) ? cleaned : `step_${cleaned || "node"}`;
+}
+
+function sampleInputValue(schema: Record<string, unknown>): unknown {
+  for (const key of ["default", "example", "const"]) {
+    if (key in schema) return schema[key];
+  }
+  if (Array.isArray(schema.examples) && schema.examples.length) return schema.examples[0];
+  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+
+  const type = Array.isArray(schema.type)
+    ? schema.type.find((value) => value !== "null")
+    : schema.type;
+  if (type === "object") {
+    const properties = typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)
+      ? schema.properties as Record<string, unknown>
+      : {};
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((value): value is string => typeof value === "string")
+      : [];
+    return Object.fromEntries(required.flatMap((key) => {
+      const property = properties[key];
+      return typeof property === "object" && property !== null && !Array.isArray(property)
+        ? [[key, sampleInputValue(property as Record<string, unknown>)]]
+        : [];
+    }));
+  }
+  if (type === "array") {
+    const minimum = typeof schema.minItems === "number" ? Math.max(0, Math.min(schema.minItems, 3)) : 0;
+    const itemSchema = typeof schema.items === "object" && schema.items !== null && !Array.isArray(schema.items)
+      ? schema.items as Record<string, unknown>
+      : {};
+    return Array.from({ length: minimum }, () => sampleInputValue(itemSchema));
+  }
+  if (type === "string") {
+    if (schema.format === "email") return "test@example.com";
+    if (schema.format === "date") return "2026-01-01";
+    if (schema.format === "date-time") return "2026-01-01T00:00:00Z";
+    return "Sample test input";
+  }
+  if (type === "integer" || type === "number") {
+    if (typeof schema.minimum === "number") return schema.minimum;
+    if (typeof schema.exclusiveMinimum === "number") return schema.exclusiveMinimum + 1;
+    return 1;
+  }
+  if (type === "boolean") return false;
+  return {};
+}
+
+function sampleWorkflowInputs(inputs: Workflow["inputs"]): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(inputs).map(([name, schema]) => [name, sampleInputValue(schema)]));
+}
+
+function capabilityInputBindings(capability: Capability | undefined): Record<string, unknown> {
+  if (!capability) return {};
+
+  const schema = capability.input_schema;
+  const properties = typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)
+    ? schema.properties as Record<string, unknown>
+    : {};
+  const sample = capability.samples?.find((value) => typeof value === "object" && value !== null && !Array.isArray(value)) || {};
+  const inputs = Object.fromEntries(Object.entries(sample).filter(([name]) =>
+    schema.additionalProperties !== false || name in properties));
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((name): name is string => typeof name === "string")
+    : [];
+
+  for (const name of required) {
+    if (name in inputs) continue;
+    const property = properties[name];
+    inputs[name] = typeof property === "object" && property !== null && !Array.isArray(property)
+      ? sampleInputValue(property as Record<string, unknown>)
+      : "Sample test input";
+  }
+  return inputs;
 }
 
 function toExpression(value: unknown): unknown {
@@ -161,18 +245,21 @@ export default function WorkflowStudio(props: Props) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [runOpen, setRunOpen] = useState(false);
-  const [inputsText, setInputsText] = useState('{"input":{}}');
   const [inputSchemaText, setInputSchemaText] = useState(JSON.stringify(initialWorkflow().inputs, null, 2));
   const [outputText, setOutputText] = useState("");
   const [validation, setValidation] = useState<Validation | null>(null);
   const [notice, setNotice] = useState("");
   const [working, setWorking] = useState(false);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
+  const [runPhase, setRunPhase] = useState<"idle" | "validating" | "running" | "waiting" | "publishing" | "failed">("idle");
+  const [runError, setRunError] = useState("");
+  const [testWorkflow, setTestWorkflow] = useState<Workflow | null>(null);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [connectingFrom, setConnectingFrom] = useState<string | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const interaction = useRef<{ kind: "move" | "pan"; id?: string; x: number; y: number; originX: number; originY: number } | null>(null);
+  const publishedTestRuns = useRef(new Set<string>());
 
   const selectedNode = workflow.nodes.find((node) => node.id === selected) || null;
   const graphIssues = useMemo(() => isValidGraph(workflow, capabilities), [workflow, capabilities]);
@@ -195,6 +282,49 @@ export default function WorkflowStudio(props: Props) {
     items.filter((item) => `${item.label} ${item.description}`.toLowerCase().includes(query.toLowerCase())),
   ] as const);
 
+  async function publishSuccessfulTest(candidate: Workflow, runId: string) {
+    if (publishedTestRuns.current.has(runId)) return;
+    publishedTestRuns.current.add(runId);
+    try {
+      await props.onSave(candidate.id, candidate, name || candidate.id, description || candidate.goal);
+      await props.onPublish(candidate.id);
+      setRunPhase("idle");
+      setRunOpen(false);
+      setNotice(`Test passed. ${candidate.id}@${candidate.version} was saved and published.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("already published")) {
+        setRunPhase("idle");
+        setRunOpen(false);
+        setNotice(`Test passed. ${candidate.id}@${candidate.version} is already published.`);
+        return;
+      }
+      publishedTestRuns.current.delete(runId);
+      setRunPhase("failed");
+      setRunError(`The test passed, but saving or publishing failed: ${message}`);
+    }
+  }
+
+  useEffect(() => {
+    const liveRun = props.liveRun;
+    if (!liveRun || liveRun.id !== runResult?.id) return;
+    setRunResult(liveRun);
+    if (liveRun.status === "completed" && testWorkflow) {
+      setRunPhase("publishing");
+      void publishSuccessfulTest(testWorkflow, liveRun.id);
+    } else if (["failed", "completed_rejected", "cancelled"].includes(liveRun.status)) {
+      const nodeErrors = Object.entries(liveRun.nodes)
+        .filter(([, node]) => node.error)
+        .map(([nodeId, node]) => `${nodeId}: ${node.error}`);
+      setRunPhase("failed");
+      setRunError(liveRun.error || nodeErrors.join("\n") || `Workflow run ended with status "${liveRun.status}".`);
+    } else if (liveRun.status === "waiting") {
+      setRunPhase("waiting");
+    } else {
+      setRunPhase("running");
+    }
+  }, [props.liveRun, runResult?.id, testWorkflow]);
+
   function applyWorkflow(doc: WorkflowDocument) {
     setWorkflow({
       ...doc.workflow,
@@ -207,6 +337,7 @@ export default function WorkflowStudio(props: Props) {
       nodes: doc.workflow.nodes.map((node, index) => ({
         ...node,
         kind: node.kind || "agent",
+        timeout_s: node.timeout_s || DEFAULT_NODE_TIMEOUT_S,
         canvas_position: node.canvas_position || { x: 340 + (index % 3) * 235, y: 160 + Math.floor(index / 3) * 155 },
       })),
     });
@@ -267,7 +398,8 @@ export default function WorkflowStudio(props: Props) {
       capability: item.capability,
       ...(item.skillId ? { skill_id: item.skillId } : {}),
       depends_on: dependency ? [dependency] : [],
-      inputs: { input: "{{input}}" },
+      inputs: capabilityInputBindings(capabilities.find((capability) => capability.id === item.capability)),
+      timeout_s: DEFAULT_NODE_TIMEOUT_S,
       canvas_position: position || { x: 350 + (workflow.nodes.length % 3) * 230, y: 150 + Math.floor(workflow.nodes.length / 3) * 150 },
     };
     setWorkflow((current) => ({
@@ -316,26 +448,32 @@ export default function WorkflowStudio(props: Props) {
       id: slug(name || workflow.id),
       goal: description || name,
       inputs,
-      nodes: workflow.nodes.map((node) => ({ ...node, inputs: toExpression(node.inputs) as Record<string, unknown> })),
+      nodes: workflow.nodes.map((node) => ({
+        ...node,
+        timeout_s: node.timeout_s || DEFAULT_NODE_TIMEOUT_S,
+        inputs: toExpression(node.inputs) as Record<string, unknown>,
+      })),
       outputs: outputText.trim()
         ? { result: toExpression(outputText.trim()) as string }
         : workflow.nodes.length ? { result: `$nodes.${workflow.nodes.at(-1)?.id}.output` } : {},
     };
   }
 
-  async function validate(candidate: Workflow): Promise<boolean> {
+  async function validate(candidate: Workflow): Promise<Validation> {
     const localIssues = isValidGraph(candidate, capabilities);
     if (localIssues.length) {
-      setValidation({ ok: false, issues: localIssues.map((message) => ({ message })) });
-      return false;
+      const result = { ok: false, issues: localIssues.map((message) => ({ message })) };
+      setValidation(result);
+      return result;
     }
     try {
       const result = await props.onValidate(candidate);
       setValidation(result);
-      return result.ok;
+      return result;
     } catch (error) {
-      setValidation({ ok: false, issues: [{ message: error instanceof Error ? error.message : String(error) }] });
-      return false;
+      const result = { ok: false, issues: [{ message: error instanceof Error ? error.message : String(error) }] };
+      setValidation(result);
+      return result;
     }
   }
 
@@ -393,6 +531,7 @@ export default function WorkflowStudio(props: Props) {
           nodes: (draft.nodes || []).map((node, index) => ({
             ...node,
             kind: node.kind || "agent",
+            timeout_s: node.timeout_s || DEFAULT_NODE_TIMEOUT_S,
             canvas_position: node.canvas_position || { x: 340 + (index % 3) * 235, y: 160 + Math.floor(index / 3) * 155 },
           })),
           outputs: draft.outputs || {},
@@ -410,26 +549,57 @@ export default function WorkflowStudio(props: Props) {
 
   async function runWorkflow() {
     let candidate: Workflow;
-    let inputs: Record<string, unknown>;
     try {
       candidate = makeWorkflow();
-      const parsed: unknown = JSON.parse(inputsText);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("Run input must be a JSON object.");
-      inputs = parsed as Record<string, unknown>;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
       return;
     }
-    if (!await validate(candidate)) return;
     setWorking(true);
     setRunResult(null);
+    setTestWorkflow(candidate);
+    setRunError("");
+    setRunPhase("validating");
     try {
-      setRunResult(await props.onRun(candidate, inputs));
+      const validationResult = await validate(candidate);
+      if (!validationResult.ok) {
+        setRunPhase("failed");
+        setRunError(validationResult.issues.map((issue) => issue.node ? `${issue.node}: ${issue.message}` : issue.message).join("\n"));
+        return;
+      }
+      setRunPhase("running");
+      const result = await props.onRun(candidate, sampleWorkflowInputs(candidate.inputs));
+      setRunResult(result);
+      if (result.status === "completed") {
+        setRunPhase("publishing");
+        await publishSuccessfulTest(candidate, result.id);
+      } else if (["failed", "completed_rejected", "cancelled"].includes(result.status)) {
+        const nodeErrors = Object.entries(result.nodes)
+          .filter(([, node]) => node.error)
+          .map(([nodeId, node]) => `${nodeId}: ${node.error}`);
+        setRunPhase("failed");
+        setRunError(result.error || nodeErrors.join("\n") || `Workflow run ended with status "${result.status}".`);
+      } else if (result.status === "waiting") {
+        setRunPhase("waiting");
+      } else {
+        setRunPhase("running");
+      }
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      setRunPhase("failed");
+      setRunError(error instanceof Error ? error.message : String(error));
     } finally {
       setWorking(false);
     }
+  }
+
+  function returnToWorkflow() {
+    const failedNode = Object.entries(runResult?.nodes || {}).find(([, node]) => node.state === "failed")?.[0]
+      || validation?.issues.find((issue) => issue.node)?.node;
+    setRunOpen(false);
+    if (failedNode) setSelected(failedNode);
+    setNotice(runError
+      ? `${runResult?.status === "completed" ? "Test passed, but saving or publishing failed" : "Test failed"}: ${runError}`
+      : "Returned to the workflow editor.");
   }
 
   function arrange() {
@@ -512,10 +682,24 @@ export default function WorkflowStudio(props: Props) {
         <button className="secondary-button compact" onClick={() => setSettingsOpen(true)}><Settings2 size={14} /> Workflow settings</button>
       </div>
       <div className="studio-toolbar">
-        <div><p className="eyebrow">CREATE / WORKFLOW</p><h2>{name || "Untitled workflow"}</h2></div>
+        <div className="studio-name-field">
+          <p className="eyebrow">CREATE / WORKFLOW</p>
+          <label htmlFor="studio-workflow-name">Workflow name</label>
+          <input id="studio-workflow-name" value={name} onChange={(event) => {
+            const value = event.target.value;
+            setName(value);
+            setWorkflow((current) => ({ ...current, id: slug(value || "new-workflow") }));
+          }} placeholder="Enter workflow name" maxLength={200} />
+        </div>
         <div className="studio-toolbar-actions">
           <button className="secondary-button compact" onClick={() => void save()} disabled={working}><Check size={14} /> Save draft</button>
-          <button className="primary-button compact" onClick={() => setRunOpen(true)} disabled={working}><Play size={14} /> Run / Test</button>
+          <button className="primary-button compact" onClick={() => {
+            setRunResult(null);
+            setRunError("");
+            setRunPhase("idle");
+            setValidation(null);
+            setRunOpen(true);
+          }} disabled={working}><Play size={14} /> Run / Test</button>
         </div>
       </div>
       <section className="studio-ai-draft">
@@ -665,14 +849,23 @@ export default function WorkflowStudio(props: Props) {
 
       {runOpen && <div className="studio-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setRunOpen(false); }}>
         <section className="studio-modal studio-run-modal" role="dialog" aria-modal="true" aria-labelledby="workflow-run-title">
-          <div className="panel-heading"><div><h2 id="workflow-run-title">Run / Test workflow</h2><p>Supply workflow input and inspect per-step results.</p></div><button className="icon-button" onClick={() => setRunOpen(false)} aria-label="Close run panel">×</button></div>
-          <label className="studio-field"><span>Input JSON</span><textarea rows={7} className="studio-code" value={inputsText} onChange={(event) => setInputsText(event.target.value)} /></label>
-          <button className="primary-button" disabled={working} onClick={() => void runWorkflow()}>{working ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />} Run workflow</button>
+          <div className="panel-heading"><div><h2 id="workflow-run-title">Run / Test workflow</h2><p>Test inputs are generated from the workflow input defaults and schema. A successful test saves and publishes this version.</p></div><button className="icon-button" onClick={() => setRunOpen(false)} aria-label="Close run panel">×</button></div>
+          <button className="primary-button" disabled={working || ["validating", "running", "waiting", "publishing"].includes(runPhase)} onClick={() => void runWorkflow()}>{working ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />} {working ? "Starting test…" : "Run workflow test"}</button>
+          {runPhase !== "idle" && <div className={`studio-test-status ${runPhase === "failed" ? "failed" : runPhase === "waiting" ? "waiting" : ""}`} role="status">
+            {runPhase === "validating" && <><LoaderCircle size={15} className="spin" /> Validating workflow before the test starts…</>}
+            {runPhase === "running" && <><LoaderCircle size={15} className="spin" /> Workflow is running. Step results will appear below.</>}
+            {runPhase === "waiting" && <><LoaderCircle size={15} className="spin" /> Workflow is waiting for human input or approval. It has not passed yet.</>}
+            {runPhase === "publishing" && <><LoaderCircle size={15} className="spin" /> Test passed. Saving and publishing this workflow version…</>}
+            {runPhase === "failed" && <><AlertCircle size={15} /> {runResult?.status === "completed" ? "The test passed, but the workflow was not saved or published." : "Test did not complete successfully. Review the reason below, then return to the workflow to make changes."}</>}
+          </div>}
+          {runError && <div className="error-box studio-test-error" role="alert"><AlertCircle size={15} /><pre>{runError}</pre></div>}
           {runResult && <div className="studio-run-result"><div className="panel-heading"><b>Run {runResult.status}</b><code>{runResult.id}</code></div>
+            {runResult.error && <div className="error-box studio-test-error" role="alert"><AlertCircle size={15} /><pre>{runResult.error}</pre></div>}
             {Object.entries(runResult.nodes).map(([id, node]) => <article className="studio-run-node" key={id}><div><b>{id}</b><span className={`status ${node.state === "succeeded" ? "good" : node.state === "failed" ? "bad" : "warn"}`}>{node.state}</span></div>
               {node.error && <p className="studio-inline-error">{node.error}</p>}{node.output !== undefined && <pre>{JSON.stringify(node.output, null, 2)}</pre>}</article>)}
             <details><summary>Workflow output</summary><pre>{JSON.stringify(runResult.outputs, null, 2)}</pre></details>
           </div>}
+          {runPhase === "failed" && <button type="button" className="secondary-button" onClick={returnToWorkflow}>Back to workflow</button>}
         </section>
       </div>}
     </div>

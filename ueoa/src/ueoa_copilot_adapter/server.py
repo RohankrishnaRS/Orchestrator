@@ -19,7 +19,14 @@ logger = logging.getLogger("ueoa_copilot_adapter.server")
 async def messages(request: Request) -> Response:
     agent: AgentApplication = request.app["agent_app"]
     adapter: CloudAdapter = request.app["adapter"]
-    return await start_agent_process(request, agent, adapter)
+    response = await start_agent_process(request, agent, adapter)
+    if response is None:
+        raise RuntimeError("The Microsoft Agents SDK did not return an HTTP response.")
+    return response
+
+
+async def get_messages(_: Request) -> Response:
+    return Response(status=200)
 
 
 async def health(_: Request) -> Response:
@@ -34,7 +41,7 @@ async def health(_: Request) -> Response:
 def create_web_app() -> Application:
     app = Application(middlewares=[jwt_authorization_middleware])
     app.router.add_post("/api/messages", messages)
-    app.router.add_get("/api/messages", lambda _: Response(status=200))
+    app.router.add_get("/api/messages", get_messages)
     app.router.add_get("/api/health", health)
     app["agent_configuration"] = AUTH_CONFIGURATION
     app["agent_app"] = AGENT_APP

@@ -14,6 +14,7 @@ from os import environ
 
 from microsoft_agents.hosting.aiohttp import CloudAdapter
 from microsoft_agents.hosting.core import AgentApplication, MemoryStorage, TurnContext, TurnState
+from microsoft_agents.hosting.core.authorization import Connections
 
 from ueoa_copilot_adapter.ueoa_client import UeoaClient, UeoaClientError
 
@@ -36,7 +37,7 @@ ANONYMOUS_DEFAULTS = {
 }
 
 
-def build_adapter() -> tuple[CloudAdapter, object, object]:
+def build_adapter() -> tuple[CloudAdapter, object, Connections]:
     """Connection manager from CONNECTIONS__* env settings (Entra app + Azure Bot in production).
 
     Without a client id the SDK runs in anonymous development mode (local Agents Playground only):

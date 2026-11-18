@@ -68,6 +68,7 @@ reloaded on restart. Cards persist only secret-reference names, never secret val
 Skills remain in the existing document store and require `UEOA_DATA_DIR` to survive restarts.
 
 Use the **Orchestrate** page to plan and run goals against the capabilities and agents you register.
+Workflows generated automatically from chat goals are saved as editable drafts and appear under **Create → Saved workflows**.
 In Orchestrator chat, select a saved workflow and describe the task in the composer. The chat goal is bound to the
 workflow's best matching declared text input (for example `prompt`, `task_description`, or `source_text`). Set defaults
 in the workflow for any other values it needs; chat sends the goal directly without per-run JSON input. The workflow

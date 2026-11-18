@@ -8,11 +8,13 @@ import logging
 import os
 import re
 import ssl
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
+from uuid import uuid4
 
 import httpx
 import truststore
@@ -56,6 +58,21 @@ STATIC = Path(__file__).resolve().parent / "static"
 DEFAULT_ENTITLEMENTS = {"admin": ["*"], "user": ["*"]}
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 NODE_TIMEOUT_HEADROOM_S = 15
+CONSOLE_PAGE_PATHS = (
+    "/",
+    "/create/prompt",
+    "/orchestrator",
+    "/agent-registry",
+    "/capabilities",
+    "/create/workflow",
+    "/create/saved-workflows",
+    "/workflows",
+    "/skills",
+    "/mcp-registry",
+    "/runs",
+    "/approvals",
+    "/audit",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +172,8 @@ async def build_services(settings: Settings, http: httpx.AsyncClient, stores: St
         registry.restore(await stores.implementations.list())
     if catalog:
         for path in sorted((catalog / "implementations").glob("*.yaml")):
-            for raw in yaml.safe_load(path.read_text(encoding="utf-8")) or []:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for raw in cast(list[dict[str, Any]], loaded or []):
                 impl = await registry.register_seed(raw)
                 if stores is not None and stores.implementations is not None:
                     await stores.implementations.upsert(impl, seed=True)
@@ -359,9 +377,39 @@ _GOAL_HINTS = frozenset(
 )
 
 
+def _schema_properties(schema: Mapping[str, Any]) -> dict[str, Any]:
+    properties = schema.get("properties", {})
+    if not isinstance(properties, Mapping):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, value in cast(Mapping[str, Any], properties).items():
+        normalized[str(key)] = value
+    return normalized
+
+
+def _schema_required(schema: Mapping[str, Any]) -> set[str]:
+    required = schema.get("required", [])
+    if not isinstance(required, list):
+        return set()
+    required_items = cast(list[Any], required)
+    return {str(item) for item in required_items if isinstance(item, str)}
+
+
 def _is_string_field(field: Any) -> bool:
-    field_type = field.type if isinstance(field, InputSpec) else field.get("type") if isinstance(field, dict) else None
-    return field_type == "string" or (isinstance(field_type, list) and "string" in field_type)
+    field_type: str | list[str] | None = None
+    if isinstance(field, InputSpec):
+        field_type = field.type
+    elif isinstance(field, dict):
+        field_map = cast(dict[str, Any], field)
+        raw_type = field_map.get("type")
+        if isinstance(raw_type, str):
+            field_type = raw_type
+        elif isinstance(raw_type, list):
+            type_values = cast(list[Any], raw_type)
+            field_type = [str(item) for item in type_values if isinstance(item, str)]
+    if field_type == "string":
+        return True
+    return isinstance(field_type, list) and "string" in field_type
 
 
 def _select_goal_field(fields: dict[str, Any], required: set[str] | None = None) -> str | None:
@@ -410,13 +458,11 @@ def _workflow_goal_inputs(spec: WorkflowSpec, goal: str, inputs: dict[str, Any])
         return {**inputs, target: goal}
 
     schema = declaration.model_extra or {}
-    properties = schema.get("properties", {})
-    if not isinstance(properties, dict):
-        properties = {}
+    properties: dict[str, Any] = _schema_properties(schema)
     property_name = next((name for name in _GOAL_INPUT_NAMES if name in properties), None)
     if property_name is None:
-        required = schema.get("required", [])
-        property_name = _select_goal_field(properties, set(required) if isinstance(required, list) else None)
+        required = _schema_required(schema)
+        property_name = _select_goal_field(properties, required)
     if property_name is None and schema.get("additionalProperties", True) is not False:
         property_name = "goal"
     if property_name is None:
@@ -443,16 +489,12 @@ def _bind_goal_to_required_agent_inputs(
         if capability is None:
             continue
         schema = capability.input_schema
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required = schema.get("required", []) if isinstance(schema, dict) else []
-        if not isinstance(properties, dict) or not isinstance(required, list):
-            continue
+        properties: dict[str, Any] = _schema_properties(schema)
+        required = _schema_required(schema)
         missing_text = {
             name: properties[name]
             for name in required
-            if name not in node.inputs
-            and name in properties
-            and _is_string_field(properties[name])
+            if name not in node.inputs and name in properties and _is_string_field(properties[name])
         }
         target = _select_goal_field(missing_text, set(missing_text))
         if target is not None:
@@ -483,6 +525,7 @@ def _infer_workflow_input(name: str, declaration: InputSpec, goal: str) -> Any:
     extra = declaration.model_extra or {}
     choices = extra.get("enum")
     if isinstance(choices, list):
+        enum_values = cast(list[Any], choices)
         category_terms = {
             "code_generation": {"code", "coding", "program", "programming", "python", "javascript", "script"},
             "story_writing": {"story", "fiction", "novel", "tale", "creative", "writing"},
@@ -492,13 +535,14 @@ def _infer_workflow_input(name: str, declaration: InputSpec, goal: str) -> Any:
             "writing": {"write", "writing", "email", "letter"},
             "general": {"general", "other", "default"},
         }[category]
-        for choice in choices:
+        for choice in enum_values:
             if isinstance(choice, str):
                 words = set(re.findall(r"[a-z0-9]+", choice.lower()))
                 if words & category_terms:
                     return choice
-        if len(choices) == 1:
-            return choices[0]
+        if len(enum_values) == 1:
+            value = enum_values[0]
+            return value if isinstance(value, str) else None
     normalized_name = name.lower().replace("-", "_")
     if normalized_name in {"task_type", "task_kind", "operation_type"}:
         return category
@@ -554,10 +598,9 @@ def _prepare_saved_workflow(
         if capability is None:
             continue
         schema = capability.input_schema
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
-        if not isinstance(properties, dict):
-            continue
+        schema_map: Mapping[str, Any] = schema
+        properties = _schema_properties(schema_map)
+        required = _schema_required(schema_map)
         for input_name, binding in list(node.inputs.items()):
             if not isinstance(binding, str):
                 continue
@@ -743,7 +786,7 @@ def create_app(
     goals_api = _optional_module("ueoa.api.goals")
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # Calls are bounded per invocation by asyncio timeouts; the client limit only guards against hangs.
         client = http or httpx.AsyncClient(
             verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), timeout=httpx.Timeout(600, connect=10)
@@ -807,20 +850,11 @@ def create_app(
         return who
 
     @app.get("/", include_in_schema=False)
-    def index() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+    def index() -> FileResponse:
         return FileResponse(STATIC / "index.html")
 
-    @app.get("/create/workflow", include_in_schema=False)
-    def workflow_studio() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(STATIC / "index.html")
-
-    @app.get("/create/saved-workflows", include_in_schema=False)
-    def saved_workflows() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(STATIC / "index.html")
-
-    @app.get("/create/prompt", include_in_schema=False)
-    def prompt_builder() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
-        return FileResponse(STATIC / "index.html")
+    for console_path in CONSOLE_PAGE_PATHS[1:]:
+        app.add_api_route(console_path, index, methods=["GET"], include_in_schema=False)
 
     @app.get("/api/v1/roles")
     def roles() -> list[str]:  # pyright: ignore[reportUnusedFunction]
@@ -1052,7 +1086,9 @@ def create_app(
         planner = require_planner()
         svc = services()
         available = available_capabilities(svc, who)
-        result = await planner.plan(body.goal, body.inputs, svc.registry.capabilities, available)
+        result = await planner.plan(
+            body.goal, body.inputs, svc.registry.capabilities, available, skills=svc.store.list("skills")
+        )
         routing = routing_view(svc, who, result.spec, available, result.considered)
         return {**result.view(), "available": available, "routing": routing}
 
@@ -1086,16 +1122,26 @@ def create_app(
             body.workflow = template["workflow"]
         available = available_capabilities(svc, who, include_writes=body.workflow is not None)
         if body.goal is not None and body.workflow_id is None:
-            planned = await require_planner().plan(body.goal, body.inputs, svc.registry.capabilities, available)
+            planned = await require_planner().plan(
+                body.goal,
+                body.inputs,
+                svc.registry.capabilities,
+                available,
+                skills=svc.store.list("skills"),
+            )
             if not planned.ok or planned.spec is None:
                 raise HTTPException(422, planned.view())
-            spec = planned.spec
+            generated_id = f"auto-{planned.spec.id[:55].rstrip('-')}-{uuid4().hex[:12]}"
+            while svc.store.get("workflows", generated_id) is not None:
+                generated_id = f"auto-{planned.spec.id[:55].rstrip('-')}-{uuid4().hex[:12]}"
+            spec = planned.spec.model_copy(update={"id": generated_id})
             meta: dict[str, Any] = {
                 "goal": body.goal,
                 "rationale": planned.rationale,
                 "attempts": planned.attempts,
                 "considered": planned.considered,
                 "planned_by": "planner",
+                "workflow_id": generated_id,
             }
             if warnings := getattr(planned, "warnings", None):
                 meta["warnings"] = list(warnings)
@@ -1122,7 +1168,9 @@ def create_app(
                 meta = {"goal": spec.goal, "rationale": "", "attempts": 0, "considered": [], "planned_by": "user"}
         meta["routing"] = routing_view(svc, who, spec, available, meta["considered"])
         capability_nodes = [n for n in spec.nodes if n.type is NodeType.CAPABILITY and n.capability]
-        blocked = sorted({n.capability for n in capability_nodes if n.capability not in available})
+        blocked = sorted(
+            {capability for capability in (n.capability for n in capability_nodes) if capability is not None and capability not in available}
+        )
         if blocked:
             raise HTTPException(403, f"not allowed or not available: {blocked}")
         if svc.node_timeout is not None:
@@ -1131,6 +1179,30 @@ def create_app(
                 if node.timeout_s is None or not svc.runner_applies_node_timeout:
                     minimum = int(svc.node_timeout(node.capability or "") or 0)
                     node.timeout_s = max(node.timeout_s or 0, minimum) or None
+        if body.goal is not None and body.workflow_id is None:
+            workflow_doc: dict[str, Any] = {
+                "id": spec.id,
+                "name": spec.goal[:200],
+                "description": body.goal,
+                "workflow": spec.model_dump(mode="json", exclude_none=True),
+                "inputs_example": {},
+                "owner": who.name,
+                "builtin": False,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "valid": True,
+                "issues": [],
+            }
+            try:
+                svc.store.put("workflows", spec.id, workflow_doc)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            if svc.stores is not None and svc.stores.workflows is not None:
+                try:
+                    await svc.stores.workflows.upsert(workflow_doc)
+                except Exception as exc:
+                    svc.store.delete("workflows", spec.id)
+                    logger.error("failed to persist generated workflow '%s' (%s)", spec.id, type(exc).__name__)
+                    raise HTTPException(503, "generated workflow could not be persisted") from exc
         try:
             run = await svc.runs.start(spec, body.inputs, who, plan=meta)
         except RunError as exc:
@@ -1225,6 +1297,14 @@ def create_app(
     for module in (agents_api, workflows_api, skills_api, mcp_catalog_api, goals_api):
         if module is not None:
             app.include_router(module.create_router(services, principal, admin, settings))
+
+    @app.get("/favicon.ico")
+    def favicon() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC / "favicon.svg", media_type="image/svg+xml")
+
+    @app.get("/favicon.svg")
+    def favicon_svg() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC / "favicon.svg", media_type="image/svg+xml")
 
     app.mount("/assets", StaticFiles(directory=STATIC / "assets", check_dir=False), name="assets")
     return app

@@ -89,6 +89,27 @@ def test_studio_route_and_publish_attestation() -> None:
         assert next_version.json()["version_ref"] == "studio-flow@0.1.1"
 
 
+def test_saved_workflows_are_ordered_by_most_recent_update() -> None:
+    with TestClient(create_app(Settings(catalog_dir=None, planner_enabled=False))) as client:
+        older = client.put(
+            "/api/v1/workflows/aaa-old-flow",
+            json={"name": "Older flow", "description": "Older workflow", "workflow": {**WORKFLOW, "id": "aaa-old-flow"}},
+            headers=USER,
+        )
+        newer = client.put(
+            "/api/v1/workflows/zzz-new-flow",
+            json={"name": "Newer flow", "description": "Newer workflow", "workflow": {**WORKFLOW, "id": "zzz-new-flow"}},
+            headers=USER,
+        )
+        assert older.status_code == 200, older.text
+        assert newer.status_code == 200, newer.text
+
+        saved = client.get("/api/v1/workflows", headers=USER).json()
+        recent_ids = [item["id"] for item in saved if item["id"] in {"aaa-old-flow", "zzz-new-flow"}]
+
+    assert recent_ids[:2] == ["zzz-new-flow", "aaa-old-flow"]
+
+
 def test_allowed_tasks_required_for_studio_workflows() -> None:
     workflow = {**WORKFLOW, "id": "missing-tasks", "allowed_tasks": []}
     with TestClient(create_app(Settings(catalog_dir=None, planner_enabled=False))) as client:
@@ -130,6 +151,14 @@ def test_prompt_builder_refines_brief_with_configured_llm() -> None:
         )
     assert response.status_code == 200, response.text
     assert response.json() == {"prompt": "A professional, implementation-ready workflow brief."}
+
+
+def test_favicon_route_serves_svg_asset() -> None:
+    with TestClient(create_app(Settings(catalog_dir=None, planner_enabled=False))) as client:
+        response = client.get("/favicon.svg")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert "<svg" in response.text
 
 
 def test_workflow_draft_reports_missing_approved_capabilities() -> None:

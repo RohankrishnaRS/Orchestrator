@@ -46,3 +46,12 @@ Desktop.ini
 
 # Local runtime data (stored agents/workflows, exported cards)
 .ueoa/
+
+# local test payloads
+payload*.json
+out-*.json
+
+
+__pycache__/
+*.pyc
+

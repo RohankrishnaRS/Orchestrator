@@ -139,6 +139,16 @@ def _summary(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _updated_at_value(doc: Mapping[str, Any]) -> float:
+    updated = doc.get("updated_at")
+    if not isinstance(updated, str):
+        return 0.0
+    try:
+        return datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _load_builtins(
     catalog_dir: Path | None, capabilities: Mapping[str, CapabilityContract]
 ) -> dict[str, dict[str, Any]]:
@@ -233,10 +243,8 @@ def create_router(
 
     @router.get("/api/v1/workflows")
     def list_workflows(_: Caller) -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
-        docs = sorted(
-            [*services().store.list(KIND), *services().store.list(VERSION_KIND)],
-            key=lambda d: (not d.get("builtin"), not d.get("published"), d["id"]),
-        )
+        docs = [*services().store.list(KIND), *services().store.list(VERSION_KIND)]
+        docs.sort(key=lambda d: _updated_at_value(d), reverse=True)
         return [_summary(fresh(doc)) for doc in docs]
 
     @router.get("/api/v1/workflows/{workflow_id}")

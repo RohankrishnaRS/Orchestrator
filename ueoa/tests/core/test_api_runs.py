@@ -185,6 +185,13 @@ def test_run_from_goal_completes(client: TestClient) -> None:
     assert (run["status"], run["outputs"]) == ("completed", {"text": "hello"})
     assert run["plan"]["planned_by"] == "planner"
     assert run["nodes"]["echo"]["implementation"] == "echo-agent@1.0.0"
+    workflow_id = run["plan"]["workflow_id"]
+    assert workflow_id == run["workflow"]["id"]
+    saved = client.get(f"/api/v1/workflows/{workflow_id}", headers=USER)
+    assert saved.status_code == 200
+    assert saved.json()["owner"] == "demo-user"
+    assert saved.json()["workflow"]["id"] == workflow_id
+    assert any(item["id"] == workflow_id for item in client.get("/api/v1/workflows", headers=USER).json())
 
 
 def test_run_from_workflow_and_long_poll(client: TestClient) -> None:

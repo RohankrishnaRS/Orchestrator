@@ -15,15 +15,16 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard, cast
 
-import jsonschema
 import yaml
 from jinja2 import StrictUndefined, Template, TemplateError
 from jinja2.sandbox import SandboxedEnvironment
+from jsonschema.exceptions import ValidationError, best_match  # pyright: ignore[reportUnknownVariableType]
+from jsonschema.validators import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ueoa.contracts.capability import SelectionDoc
@@ -67,6 +68,10 @@ VALIDATE_SHAPE = '{"valid": bool, "confidence": number 0-100, "summary": str|nul
 _ENV = SandboxedEnvironment(undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True, autoescape=False)
 
 
+def _empty_samples() -> list[dict[str, Any]]:
+    return []
+
+
 @lru_cache(maxsize=256)
 def _template(source: str) -> Template:
     return _ENV.from_string(source)
@@ -100,7 +105,7 @@ class TaskCapability(BaseModel):
     selection_doc: SelectionDoc | None = None
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
-    samples: list[dict[str, Any]] = Field(default_factory=list)
+    samples: list[dict[str, Any]] = Field(default_factory=_empty_samples)
 
 
 class TaskCard(BaseModel):
@@ -124,6 +129,10 @@ class Knowledge(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     definition: str = ""
     queries: list[str] = Field(default_factory=list)
+
+
+def _empty_knowledge() -> list[Knowledge]:
+    return []
 
 
 class RetrievalSpec(BaseModel):
@@ -167,7 +176,7 @@ class TaskDefinition(BaseModel):
     reviewer_prompt_template: str | None = None
     validate_prompt_template: str | None = None
     retrieval: RetrievalSpec | None = None
-    knowledge: list[Knowledge] = Field(default_factory=list)
+    knowledge: list[Knowledge] = Field(default_factory=_empty_knowledge)
     fallback: Knowledge | None = None
     output: OutputFields = Field(default_factory=OutputFields)
     max_rounds: int = Field(default=1, ge=0, le=3)
@@ -198,15 +207,20 @@ class TaskDefinition(BaseModel):
 def load_task_file(path: Path) -> list[TaskDefinition]:
     """Task definitions from a YAML or JSON file holding a list of tasks or `{tasks: [...]}`."""
     text = path.read_text(encoding="utf-8")
-    raw = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
-    entries = raw.get("tasks") if isinstance(raw, dict) else raw
-    return [TaskDefinition.model_validate(entry) for entry in entries or []]
+    raw: Any = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
+    entries: Any = cast(dict[Any, Any], raw).get("tasks") if isinstance(raw, dict) else raw
+    task_entries: Iterable[Any] = cast(Iterable[Any], entries or [])
+    return [TaskDefinition.model_validate(entry) for entry in task_entries]
 
 
 def build_card(task: TaskDefinition) -> dict[str, Any]:
     capability, card = task.capability, task.card
     selection = capability.selection_doc
-    examples = [e for group in (selection.examples.values() if selection else []) for e in group][:4]
+    examples: list[str] = []
+    if selection is not None:
+        for group in selection.examples.values():
+            examples.extend(group)
+    examples = examples[:4]
     return {
         "name": card.name,
         "description": card.description,
@@ -287,10 +301,17 @@ def _lookup(payload: Mapping[str, Any], path: str) -> Any:
     return value  # pyright: ignore[reportUnknownVariableType]
 
 
+def _is_string_keyed_dict(value: Any) -> TypeGuard[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return False
+    mapping: dict[Any, Any] = cast(dict[Any, Any], value)
+    return all(isinstance(key, str) for key in mapping)
+
+
 def _documents(payload: Mapping[str, Any], path: str) -> list[dict[str, Any]]:
     value = _lookup(payload, path)
-    documents = value if isinstance(value, list) else [value]
-    return [d for d in documents if isinstance(d, dict)]  # pyright: ignore[reportUnknownVariableType]
+    documents: list[Any] = cast(list[Any], value) if isinstance(value, list) else [value]
+    return [document for document in documents if _is_string_keyed_dict(document)]
 
 
 def _no_text_reason(documents: list[dict[str, Any]]) -> str:
@@ -340,10 +361,15 @@ def _chunk_vars(chunk: Chunk, position: int | None = None) -> dict[str, Any]:
 
 
 def _schema_error(answer: dict[str, Any], schema: dict[str, Any]) -> str | None:
-    error = jsonschema.exceptions.best_match(jsonschema.Draft202012Validator(schema).iter_errors(answer))
+    errors = cast(
+        Iterable[ValidationError],
+        Draft202012Validator(schema).iter_errors(answer),  # pyright: ignore[reportUnknownMemberType]
+    )
+    error = cast(ValidationError | None, best_match(errors))
     if error is None:
         return None
-    where = "/".join(str(p) for p in error.absolute_path) or "(root)"
+    error_path = cast(Iterable[str | int], error.absolute_path)  # pyright: ignore[reportUnknownMemberType]
+    where = "/".join(str(part) for part in error_path) or "(root)"
     return f"{where}: {error.message}"
 
 
@@ -374,17 +400,19 @@ async def _llm_call(
 
 
 def _answers(raw: Any) -> dict[str, dict[str, Any]]:
-    items = raw.get("items") if isinstance(raw, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    items: Any = raw.get("items") if _is_string_keyed_dict(raw) else None
     found: dict[str, dict[str, Any]] = {}
-    for item in items if isinstance(items, list) else []:  # pyright: ignore[reportUnknownVariableType]
-        if isinstance(item, dict) and _text(item.get("id")):  # pyright: ignore[reportUnknownMemberType]
-            found[_text(item["id"])] = dict(item)  # pyright: ignore[reportUnknownArgumentType]
+    answer_items: list[Any] = cast(list[Any], items) if isinstance(items, list) else []
+    for item in answer_items:
+        if _is_string_keyed_dict(item) and _text(item.get("id")):
+            found[_text(item["id"])] = item
     return found
 
 
 def _errors(raw: Any) -> list[Any]:
-    errors = raw.get("errors") if isinstance(raw, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    return [e for e in errors if isinstance(e, str | dict) and e] if isinstance(errors, list) else []  # pyright: ignore[reportUnknownVariableType]
+    errors: Any = raw.get("errors") if _is_string_keyed_dict(raw) else None
+    error_items: list[Any] = cast(list[Any], errors) if isinstance(errors, list) else []
+    return [error for error in error_items if isinstance(error, str | dict) and error]
 
 
 def _evidence(quote: str, chunk_id: Any, chunks: list[Chunk]) -> tuple[Chunk, str] | None:
@@ -398,7 +426,9 @@ def _evidence(quote: str, chunk_id: Any, chunks: list[Chunk]) -> tuple[Chunk, st
 
 def _entry(task: TaskDefinition, item: Any, answer: dict[str, Any], chunks: list[Chunk]) -> dict[str, Any]:
     out = task.output
-    entry: dict[str, Any] = {f: item.get(f) for f in out.copy_fields} if isinstance(item, dict) else {}  # pyright: ignore[reportUnknownMemberType]
+    entry: dict[str, Any] = (
+        {field: item.get(field) for field in out.copy_fields} if _is_string_keyed_dict(item) else {}
+    )
     value, quote = _text(answer.get("value")), _text(answer.get("quote"))
     evidence = _evidence(quote, answer.get("chunk_id"), chunks) if value and quote else None
     if evidence is None:
@@ -426,11 +456,10 @@ async def _review_batch(
     chain_id: str | None,
 ) -> list[dict[str, Any]]:
     chunks = sorted({c for _, _, found in batch for c in found}, key=lambda c: c.position)
-    items = [
-        (dict(item) if isinstance(item, dict) else {"text": item})
-        | {"id": item_id, "chunk_ids": [c.chunk_id for c in found]}  # pyright: ignore[reportUnknownArgumentType]
-        for item_id, item, found in batch
-    ]
+    items: list[dict[str, Any]] = []
+    for item_id, item, found in batch:
+        item_fields = item if _is_string_keyed_dict(item) else {"text": item}
+        items.append(item_fields | {"id": item_id, "chunk_ids": [chunk.chunk_id for chunk in found]})
     variables = {**payload, "items": items, "chunks": [_chunk_vars(c) for c in chunks]}
     system = render(task.system_prompt_template, variables) + _rules(ANALYST_SHAPE)
     reviewer = render(task.reviewer_prompt_template or "", variables) + _rules(REVIEWER_SHAPE)
@@ -471,12 +500,16 @@ async def _analyst_reviewer(
 
 
 def _flags(raw: dict[str, Any], count: int) -> list[int]:
-    flags = raw.get("flags")
+    flags: Any = raw.get("flags")
     chosen: set[int] = set()
-    for flag in flags if isinstance(flags, list) else []:  # pyright: ignore[reportUnknownVariableType]
-        if isinstance(flag, dict) and flag.get("is_match") is True:  # pyright: ignore[reportUnknownMemberType]
+    flag_items: list[Any] = cast(list[Any], flags) if isinstance(flags, list) else []
+    for flag in flag_items:
+        if _is_string_keyed_dict(flag) and flag.get("is_match") is True:
+            raw_index: Any = flag.get("index")
+            if raw_index is None:
+                continue
             try:
-                position = int(flag.get("index"))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                position = int(raw_index)
             except (TypeError, ValueError):
                 continue
             if 0 <= position < count:
@@ -527,14 +560,15 @@ async def _classify(
     flagged = [chunks[i] for i in _flags(answer, len(chunks))]
     if not flagged:
         return result | {"not_found_reason": f"no retrieved passage was identified as {name}"}
-    spans = [
-        {"quote": s.text, "start": s.start, "end": s.end, "section": s.section, "page": s.page}
-        for s in index.stitch(flagged)
+    stitched = index.stitch(flagged)
+    spans: list[dict[str, Any]] = [
+        {"quote": span.text, "start": span.start, "end": span.end, "section": span.section, "page": span.page}
+        for span in stitched
     ]
     if task.validate_prompt_template is None:
         return result | {"present": True, out.spans_field: spans}
-    passage = "\n\n".join(s["quote"] for s in spans)
-    pages = sorted({s["page"] for s in spans if s["page"] is not None})
+    passage = "\n\n".join(span.text for span in stitched)
+    pages = sorted({span.page for span in stitched if span.page is not None})
     system = render(task.validate_prompt_template, variables | {"passage": passage, "pages": pages}) + _rules(
         VALIDATE_SHAPE
     )

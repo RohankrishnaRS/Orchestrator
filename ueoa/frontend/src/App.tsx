@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import RegisterCapability from "./RegisterCapability";
+import { pageForPath, pathForPage, type Page } from "./routes";
 import {
   Activity, AlertCircle, ArrowRight, Bot, Check, ChevronRight, CircleHelp,
   Clock3, Copy, Database, FileText, GitBranch, LayoutDashboard, LoaderCircle,
@@ -125,6 +126,7 @@ type ChatMessage = {
   attachments?: ChatAttachment[];
   selectedCapabilities?: string[];
   workflowId?: string;
+  automaticWorkflow?: boolean;
   stage?: "planning" | "running" | "completed" | "failed" | "cancelled";
   statusText?: string;
   plan?: JsonRecord;
@@ -180,8 +182,6 @@ type Data = {
   mcpServers: McpServer[];
   overview: OverviewStats | null;
 };
-type Page = "Overview" | "Prompt Builder" | "Orchestrator" | "Agent Registry" | "Capabilities" | "Workflow" | "Saved workflows" | "Workflows" | "Skills" | "MCP Registry" | "Runs" | "Approvals" | "Audit";
-
 const EMPTY: Data = {
   health: null,
   capabilities: [],
@@ -216,13 +216,6 @@ class ApiError extends Error {
     super(message);
     this.status = status;
   }
-}
-
-function pageFromLocation(): Page {
-  if (window.location.pathname === "/create/workflow") return "Workflow";
-  if (window.location.pathname === "/create/saved-workflows") return "Saved workflows";
-  if (window.location.pathname === "/create/prompt") return "Prompt Builder";
-  return "Overview";
 }
 
 async function api<T>(
@@ -276,7 +269,7 @@ function statusTone(value: string): string {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>(pageFromLocation);
+  const [page, setPage] = useState<Page>(() => pageForPath(window.location.pathname));
   const [studioWorkflowId, setStudioWorkflowId] = useState<string | null>(() =>
     new URLSearchParams(window.location.search).get("workflow"),
   );
@@ -358,7 +351,7 @@ function App() {
   }, [role]);
   useEffect(() => {
     const syncRoute = () => {
-      setPage(pageFromLocation());
+      setPage(pageForPath(window.location.pathname));
       const params = new URLSearchParams(window.location.search);
       setStudioWorkflowId(params.get("workflow"));
       setStudioPrompt(params.get("prompt"));
@@ -395,13 +388,12 @@ function App() {
     if (workflowId) query.set("workflow", workflowId);
     if (prompt) query.set("prompt", prompt);
     const suffix = query.size ? `?${query.toString()}` : "";
-    const path = next === "Workflow"
-      ? `/create/workflow${suffix}`
-      : next === "Saved workflows" ? "/create/saved-workflows"
-        : next === "Prompt Builder" ? "/create/prompt" : "/";
+    const path = `${pathForPage(next)}${suffix}`;
     setStudioWorkflowId(next === "Workflow" ? workflowId || null : null);
     setStudioPrompt(next === "Workflow" ? prompt || null : null);
-    if (window.location.href !== new URL(path, window.location.origin).href) window.history.pushState({}, "", path);
+    if (window.location.href !== new URL(path, window.location.origin).href) {
+      window.history.pushState({ page: next }, "", path);
+    }
     setMobileMenu(false);
   };
 
@@ -428,7 +420,7 @@ function App() {
         body: { workflow_id: workflowId, inputs: parsedInputs },
       });
       setSelectedRun(run);
-      setPage("Runs");
+      navigate("Runs");
       announce(`Run ${run.id} started.`);
       await refresh();
     } catch (error) {
@@ -667,6 +659,14 @@ function App() {
     return saved;
   }
 
+  async function publishStudioWorkflow(id: string): Promise<void> {
+    await api(`/api/v1/workflows/${encodeURIComponent(id)}/publish`, role, {
+      method: "POST",
+      body: { attest: false },
+    });
+    await refresh();
+  }
+
   async function generateStudioWorkflow(goal: string): Promise<{
     ok: boolean;
     workflow: Workflow | null;
@@ -770,10 +770,15 @@ function App() {
             <div className="nav-group" key={group}>
               <div className="nav-label">{group}</div>
               {NAV.filter((item) => item.group === group).map(({ label, icon: Icon }) => (
-                <button key={label} className={`nav-item ${page === label ? "selected" : ""}`} onClick={() => navigate(label)}>
+                <a key={label} className={`nav-item ${page === label ? "selected" : ""}`} href={pathForPage(label)}
+                  onClick={(event) => {
+                    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    event.preventDefault();
+                    navigate(label);
+                  }}>
                   <Icon size={16} /><span>{label}</span>
                   {label === "Approvals" && data.approvals.length > 0 && <span className="nav-count">{data.approvals.length}</span>}
-                </button>
+                </a>
               ))}
             </div>
           ))}
@@ -802,6 +807,7 @@ function App() {
               data={data} role={role} selectedRun={selectedRun}
               onSelectedRun={setSelectedRun} onClearRun={() => setSelectedRun(null)}
               onCancelRun={cancelRun} cancellingRunId={cancellingRunId}
+              onRefresh={refresh}
               onViewAudit={viewAudit} onViewApprovals={() => navigate("Approvals")}
             />
           )}
@@ -817,6 +823,7 @@ function App() {
               onLoad={loadStudioWorkflow}
               onValidate={validateStudioWorkflow}
               onSave={saveStudioWorkflow}
+              onPublish={publishStudioWorkflow}
               onDraft={generateStudioWorkflow}
               onRun={runStudioWorkflow}
             />
@@ -1192,10 +1199,11 @@ function Markdown({ source }: { source: string }) {
   return <div className="markdown-content">{blocks}</div>;
 }
 
-function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCancelRun, cancellingRunId, onViewAudit, onViewApprovals }: {
+function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCancelRun, cancellingRunId, onRefresh, onViewAudit, onViewApprovals }: {
   data: Data; role: string; selectedRun: RunDetail | null;
   onSelectedRun: (run: RunDetail) => void; onClearRun: () => void;
   onCancelRun: (id: string) => void; cancellingRunId: string | null;
+  onRefresh: () => Promise<void>;
   onViewAudit: () => void; onViewApprovals: () => void;
 }) {
   const loaded = useMemo(loadChatMessages, []);
@@ -1291,9 +1299,10 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [menuOpen]);
   useEffect(() => {
+    if (mode === "automatic") return;
     const currentWorkflow = mode.startsWith("workflow:") ? mode.slice("workflow:".length) : "";
     if (!workflowChoices.some((workflow) => workflow.id === currentWorkflow)) {
-      setMode(workflowChoices[0] ? `workflow:${workflowChoices[0].id}` : "");
+      setMode(workflowChoices[0] ? `workflow:${workflowChoices[0].id}` : "automatic");
     }
   }, [mode, workflowChoices]);
 
@@ -1358,13 +1367,14 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
 
   async function sendMessage(selectedMode = mode, resend?: ChatRequest) {
     if (sending) return;
+    const automaticWorkflow = selectedMode === "automatic";
     const workflowId = selectedMode.startsWith("workflow:") ? selectedMode.slice("workflow:".length) : "";
     const workflow = data.workflows.find((item) => item.id === workflowId);
-    if (!workflowId) {
-      setComposerError("Choose a saved workflow before starting a run.");
+    if (!automaticWorkflow && !workflowId) {
+      setComposerError("Choose automatic workflow creation or select a saved workflow.");
       return;
     }
-    if (!workflow) {
+    if (!automaticWorkflow && !workflow) {
       setComposerError(`Workflow '${workflowId}' is no longer available.`);
       return;
     }
@@ -1393,12 +1403,16 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
       ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
       ...(capabilities.length ? { selectedCapabilities: capabilities } : {}),
       ...(workflowId ? { workflowId } : {}),
+      ...(automaticWorkflow ? { automaticWorkflow: true } : {}),
     };
     const assistantId = newChatId();
     const assistantMessage: ChatMessage = {
       id: assistantId, role: "assistant", text: "", stage: "running",
-      statusText: "Processing your goal with the saved workflow...",
+      statusText: automaticWorkflow
+        ? "Creating a workflow from registered capabilities..."
+        : "Processing your goal with the saved workflow...",
       ...(workflowId ? { workflowId } : {}),
+      ...(automaticWorkflow ? { automaticWorkflow: true } : {}),
     };
     const request: ChatRequest = { text, inputs: runInputs, attachmentMeta, documents, capabilities };
     requestByMessage.current.set(assistantId, request);
@@ -1414,17 +1428,30 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
     try {
       const run = await api<RunDetail>("/api/v1/runs", role, {
         method: "POST",
-        body: { workflow_id: workflowId, goal: text, inputs: runInputs, wait_s: 0 },
+        body: {
+          ...(workflowId ? { workflow_id: workflowId } : {}),
+          goal: text,
+          inputs: runInputs,
+          wait_s: 0,
+        },
       });
       onSelectedRun(run);
+      if (automaticWorkflow) void onRefresh();
       updateMessage(assistantId, (message) => ({
         ...message, run, stage: run.status === "completed" ? "completed" :
           run.status === "cancelled" ? "cancelled" :
             CHAT_TERMINAL_FAILURES.has(run.status) ? "failed" : "running",
         statusText: run.status === "completed" ? "Completed" :
           run.status === "cancelled" ? "Stopped" :
-            CHAT_TERMINAL_FAILURES.has(run.status) ? "Run failed" : "Running...",
-        ...(workflowId ? { plan: { workflow: run.workflow, rationale: run.plan?.rationale || `Running saved workflow for: ${text}` } } : {}),
+            CHAT_TERMINAL_FAILURES.has(run.status) ? "Run failed" :
+              automaticWorkflow ? "Automatically generated workflow is running..." : "Running...",
+        plan: {
+          workflow: run.workflow,
+          rationale: run.plan?.rationale || (automaticWorkflow
+            ? `Workflow generated from registered capabilities for: ${text}`
+            : `Running saved workflow for: ${text}`),
+          ...(run.plan?.routing ? { routing: run.plan.routing } : {}),
+        },
       }));
     } catch (error) {
       const reason = apiErrorText(error);
@@ -1461,12 +1488,13 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
       </div>
       <div className="orchestrator-thread" ref={threadRef} role="log" aria-live="polite" aria-label="Conversation">
         {!messages.length && <div className="chat-welcome"><div className="chat-avatar"><Bot size={19} /></div>
-          <h3>Choose a workflow to get started</h3><p>Add files or capabilities from the plus menu, then run one of your saved workflows.</p></div>}
+          <h3>Choose how to run your goal</h3><p>Automatically create a workflow from available registered capabilities, or select a saved workflow.</p></div>}
         {messages.map((message) => <article key={message.id} className={`chat-message ${message.role}`}>
           {message.role === "assistant" && <div className="chat-avatar" aria-hidden="true"><Bot size={16} /></div>}
           <div className="chat-message-body">
             {message.role === "assistant" && <div className="chat-speaker">UEOA <span>{message.statusText}</span></div>}
             {message.role === "user" && message.workflowId && <span className="chat-workflow-note">Workflow: {message.workflowId}</span>}
+            {message.role === "user" && message.automaticWorkflow && <span className="chat-workflow-note">Automatic workflow</span>}
             {message.role === "user" && <p className="chat-user-text">{message.text}</p>}
             {message.selectedCapabilities && <div className="chat-capability-list">{message.selectedCapabilities.map((capability) =>
               <span className="chat-capability-chip" key={capability}>{capability}</span>)}</div>}
@@ -1528,7 +1556,7 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
           </div>
           <div className="composer-form">
             <textarea className="goal-composer" aria-label="Workflow goal"
-              placeholder="Describe what you want the selected workflow to do…"
+              placeholder={mode === "automatic" ? "Describe your goal and UEOA will create a workflow…" : "Describe what you want the selected workflow to do…"}
               value={chatText} rows={2} onChange={(event) => setChatText(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
@@ -1537,10 +1565,10 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
                 }
               }} />
             <div className="composer-controls">
-              <select aria-label="Saved workflow" value={mode} onChange={(event) => setMode(event.target.value)}>
-                {!workflowChoices.length && <option value="">No saved workflows</option>}
+              <select aria-label="Workflow mode" value={mode} onChange={(event) => setMode(event.target.value)}>
+                <option value="automatic">Create workflow automatically</option>
                 {workflowChoices.map((workflow) => <option value={`workflow:${workflow.id}`} key={workflow.id}>
-                  {workflow.name || workflow.id}{workflow.published ? ` · v${workflow.version || "published"}` : ""}
+                  Use saved: {workflow.name || workflow.id}{workflow.published ? ` · v${workflow.version || "published"}` : ""}
                 </option>)}
               </select>
               <button type="button" className="primary-button send-button" disabled={sending || !mode || !chatText.trim()}
@@ -1550,7 +1578,9 @@ function Orchestrator({ data, role, selectedRun, onSelectedRun, onClearRun, onCa
             </div>
           </div>
         </div>
-        <p className="composer-hint">Type a goal, choose a saved workflow, and press Enter or Send. Use + for files, capabilities, and extra workflow inputs.</p>
+        <p className="composer-hint">{mode === "automatic"
+          ? "Enter a goal to create and run a workflow using available registered capabilities. Use + to add files or focus capabilities."
+          : "Enter a goal to run it with the selected saved workflow. Use + to add files, capabilities, and extra workflow inputs."}</p>
       </div>
     </section>
   );
@@ -1560,10 +1590,12 @@ function PlanSummary({ plan }: { plan: JsonRecord }) {
   const workflow = isRecord(plan.workflow) ? plan.workflow : {};
   const nodes = Array.isArray(workflow.nodes) ? workflow.nodes.filter(isRecord) : [];
   const rationale = typeof plan.rationale === "string" ? plan.rationale : "Plan generated from the available capabilities.";
+  const savedWorkflowId = plan.planned_by === "planner" && typeof plan.workflow_id === "string" ? plan.workflow_id : null;
   const routing = isRecord(plan.routing) && Array.isArray(plan.routing.selected)
     ? plan.routing.selected.filter(isRecord) : [];
   return <div className="chat-plan">
     <p>{rationale}</p>
+    {savedWorkflowId && <p>Saved draft: <code>{savedWorkflowId}</code></p>}
     {nodes.length > 0 && <ol className="plan-step-list">{nodes.map((node, index) => {
       const id = typeof node.id === "string" ? node.id : `step-${index + 1}`;
       const capability = typeof node.capability === "string" ? node.capability : String(node.type || "workflow step");
@@ -1939,7 +1971,7 @@ function Registry({ onCapabilityRegistered, data, role, registerUrl, setRegister
         </article>)}</div> : <EmptyState text="No registry implementations match this filter." />}
       </section>
       <RegisterCapability role={role} onRegistered={onCapabilityRegistered} />
-      <section className="panel"><div className="panel-heading"><div><h2>Register an agent</h2><p>Use a published A2A card or create a model-backed hosted agent.</p></div></div>
+      <section className="panel agent-registration-panel"><div className="panel-heading"><div><h2>Register an agent</h2><p>Use a published A2A card or create a model-backed hosted agent.</p></div></div>
         <div className="tab-row" role="tablist" aria-label="Agent registration method">
           <button type="button" className={`tab-button ${registrationMode === "describe" ? "selected" : ""}`} onClick={() => setRegistrationMode("describe")}><Sparkles size={14} /> Describe with AI</button>
           <button type="button" className={`tab-button ${registrationMode === "automatic" ? "selected" : ""}`} onClick={() => setRegistrationMode("automatic")}>Automatic · A2A discovery</button>
@@ -2291,8 +2323,10 @@ function SavedWorkflows({ workflows, onEdit, onDelete, onCreate }: {
   onDelete: (id: string) => void;
   onCreate: () => void;
 }) {
-  const saved = workflows.filter((workflow) => !workflow.builtin && !workflow.published);
-  const published = workflows.filter((workflow) => workflow.published);
+  const saved = [...workflows.filter((workflow) => !workflow.builtin && !workflow.published)]
+    .sort((left, right) => Number(new Date(right.updated_at)) - Number(new Date(left.updated_at)));
+  const published = [...workflows.filter((workflow) => workflow.published)]
+    .sort((left, right) => Number(new Date(right.updated_at)) - Number(new Date(left.updated_at)));
   return (
     <section className="panel saved-workflows">
       <div className="panel-heading">
